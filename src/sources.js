@@ -3,7 +3,14 @@ import path from "node:path";
 import { exec } from "./util.js";
 
 export const VIDEO_EXTS = new Set([
-  ".mov", ".mp4", ".m4v", ".mkv", ".webm", ".avi", ".mpg", ".mpeg",
+  ".mov",
+  ".mp4",
+  ".m4v",
+  ".mkv",
+  ".webm",
+  ".avi",
+  ".mpg",
+  ".mpeg",
 ]);
 
 /**
@@ -28,18 +35,20 @@ export async function resolveInputs(input) {
 
   const entries = await fs.readdir(target, { withFileTypes: true });
   const videos = entries
-    .filter((e) => e.isFile() && VIDEO_EXTS.has(path.extname(e.name).toLowerCase()))
+    .filter(
+      (e) => e.isFile() && VIDEO_EXTS.has(path.extname(e.name).toLowerCase()),
+    )
     .map((e) => path.join(target, e.name))
     .sort((a, b) =>
       path.basename(a).localeCompare(path.basename(b), undefined, {
         numeric: true,
         sensitivity: "base",
-      })
+      }),
     );
   if (!videos.length) {
     throw new Error(
       `No eligible videos found in ${target}\n` +
-        `(looked for: ${[...VIDEO_EXTS].join(", ")})`
+        `(looked for: ${[...VIDEO_EXTS].join(", ")})`,
     );
   }
   return { mode: "dir", dir: target, videos };
@@ -47,7 +56,7 @@ export async function resolveInputs(input) {
 
 /**
  * Probe each video and lay them out on a single combined timeline.
- * Returns sources: [{ index, path, name, duration, offset }] and totalDuration.
+ * Returns sources: [{ index, path, name, duration, hasAudio, offset }] and totalDuration.
  */
 export async function buildTimeline(ffprobe, videos) {
   const sources = [];
@@ -55,11 +64,13 @@ export async function buildTimeline(ffprobe, videos) {
   for (let i = 0; i < videos.length; i++) {
     const p = videos[i];
     const duration = await probeDuration(ffprobe, p);
+    const hasAudio = await probeHasAudio(ffprobe, p);
     sources.push({
       index: i,
       path: p,
       name: path.basename(p),
       duration,
+      hasAudio,
       offset,
     });
     offset += duration || 0;
@@ -73,17 +84,44 @@ export async function probeDuration(ffprobe, input) {
     const { stdout } = await exec(
       ffprobe,
       [
-        "-v", "error",
-        "-show_entries", "format=duration",
-        "-of", "default=noprint_wrappers=1:nokey=1",
+        "-v",
+        "error",
+        "-show_entries",
+        "format=duration",
+        "-of",
+        "default=noprint_wrappers=1:nokey=1",
         input,
       ],
-      { capture: true }
+      { capture: true },
     );
     const d = parseFloat(stdout.trim());
     return Number.isFinite(d) ? d : 0;
   } catch {
     return 0;
+  }
+}
+
+export async function probeHasAudio(ffprobe, input) {
+  if (!ffprobe) return true;
+  try {
+    const { stdout } = await exec(
+      ffprobe,
+      [
+        "-v",
+        "error",
+        "-select_streams",
+        "a:0",
+        "-show_entries",
+        "stream=codec_type",
+        "-of",
+        "default=noprint_wrappers=1:nokey=1",
+        input,
+      ],
+      { capture: true },
+    );
+    return stdout.trim().length > 0;
+  } catch {
+    return true;
   }
 }
 

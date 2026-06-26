@@ -30,7 +30,14 @@ export async function parseTranscript(jsonPath) {
 
 /** Markdown index — quick, plain, agent-readable. */
 export async function writeIndex({
-  outDir, title, sources, totalDuration, frames, opts, hasContactSheet,
+  outDir,
+  title,
+  sources,
+  totalDuration,
+  frames,
+  opts,
+  hasContactSheet,
+  transcriptUnavailable,
 }) {
   const multi = sources.length > 1;
   const L = [];
@@ -48,17 +55,21 @@ export async function writeIndex({
   for (const s of sources) {
     L.push(
       `| ${s.index + 1} | \`${s.name}\` | ${fmtTime(s.offset)} | ${fmtTime(
-        s.duration
-      )} |`
+        s.duration,
+      )} |`,
     );
   }
   L.push("");
 
   if (opts.transcript) {
     L.push(`## Transcript\n`);
-    L.push(`- Plain text: \`transcript/transcript.txt\``);
-    L.push(`- Timestamped (SRT): \`transcript/transcript.srt\``);
-    L.push(`- Structured (JSON): \`transcript/transcript.json\`\n`);
+    if (transcriptUnavailable) {
+      L.push(`- Warning: ${transcriptUnavailable}\n`);
+    } else {
+      L.push(`- Plain text: \`transcript/transcript.txt\``);
+      L.push(`- Timestamped (SRT): \`transcript/transcript.srt\``);
+      L.push(`- Structured (JSON): \`transcript/transcript.json\`\n`);
+    }
   }
 
   if (opts.frames && frames.length) {
@@ -71,8 +82,12 @@ export async function writeIndex({
     L.push(`| Time | ${multi ? "Source | " : ""}Image |`);
     L.push(`|------|${multi ? "--------|" : ""}-------|`);
     for (const f of frames) {
-      const srcCol = multi ? ` S${f.sourceIndex + 1} (${fmtTime(f.localTime)}) |` : "";
-      L.push(`| ${fmtTime(f.globalTime)} |${srcCol} ![${fmtTime(f.globalTime)}](frames/${f.file}) |`);
+      const srcCol = multi
+        ? ` S${f.sourceIndex + 1} (${fmtTime(f.localTime)}) |`
+        : "";
+      L.push(
+        `| ${fmtTime(f.globalTime)} |${srcCol} ![${fmtTime(f.globalTime)}](frames/${f.file}) |`,
+      );
     }
     L.push("");
   }
@@ -82,8 +97,16 @@ export async function writeIndex({
 
 /** Self-contained HTML report tying everything together. */
 export async function writeHtmlReport({
-  outDir, title, sources, totalDuration, frames, segments, opts,
-  contactSheetFile, generated,
+  outDir,
+  title,
+  sources,
+  totalDuration,
+  frames,
+  segments,
+  opts,
+  contactSheetFile,
+  generated,
+  transcriptUnavailable,
 }) {
   const multi = sources.length > 1;
 
@@ -92,7 +115,7 @@ export async function writeHtmlReport({
       <span><b>${fmtTime(totalDuration)}</b> total</span>
       <span><b>${sources.length}</b> source${sources.length > 1 ? "s" : ""}</span>
       <span><b>${frames.length}</b> screenshots</span>
-      <span><b>${segments.length}</b> transcript segments</span>
+      <span><b>${transcriptUnavailable ? "unavailable" : segments.length}</b> transcript${transcriptUnavailable ? "" : " segments"}</span>
       <span class="dim">generated ${esc(generated)}</span>
     </div>`;
 
@@ -109,7 +132,7 @@ export async function writeHtmlReport({
             <td><code>${esc(s.name)}</code></td>
             <td>${fmtTime(s.offset)}</td>
             <td>${fmtTime(s.duration)}</td>
-          </tr>`
+          </tr>`,
           )
           .join("\n")}
         </tbody>
@@ -126,6 +149,9 @@ export async function writeHtmlReport({
 
   const haveFrames = opts.frames && frames.length > 0;
   const haveText = opts.transcript && segments.length > 0;
+  const warning = transcriptUnavailable
+    ? `<section class="warning"><b>Transcript unavailable.</b> ${esc(transcriptUnavailable)}</section>`
+    : "";
 
   // Interleaved walkthrough: each screenshot paired with the narration spoken
   // during its window (from its timestamp until the next screenshot).
@@ -138,7 +164,8 @@ export async function writeHtmlReport({
       ${frames
         .map((f, i) => {
           const start = i === 0 ? -Infinity : f.globalTime;
-          const end = i + 1 < frames.length ? frames[i + 1].globalTime : Infinity;
+          const end =
+            i + 1 < frames.length ? frames[i + 1].globalTime : Infinity;
           const segs = segments.filter((s) => s.t >= start && s.t < end);
           const { source, localTime } = sourceAt(sources, f.globalTime);
           let divider = "";
@@ -153,7 +180,7 @@ export async function writeHtmlReport({
             segs
               .map(
                 (s) =>
-                  `<p><span class="ts">${fmtTime(s.t)}</span> ${esc(s.text)}</p>`
+                  `<p><span class="ts">${fmtTime(s.t)}</span> ${esc(s.text)}</p>`,
               )
               .join("\n") || `<p class="dim">(no narration)</p>`;
           return `${divider}<div class="row">
@@ -223,6 +250,7 @@ export async function writeHtmlReport({
   .meta b { color:var(--fg); }
   main { max-width:1100px; margin:0 auto; padding:24px 32px 80px; }
   section { margin:34px 0; }
+  .warning { margin:0 0 24px; padding:10px 14px; border:1px solid #7a5a1d; border-radius:8px; background:#211b10; color:#f2d18a; }
   .dim { color:var(--dim); }
   code { background:var(--panel); padding:1px 6px; border-radius:4px; font-size:13px; }
   table.lineage { border-collapse:collapse; width:100%; font-size:14px; }
@@ -259,6 +287,7 @@ export async function writeHtmlReport({
   ${meta}
 </header>
 <main>
+  ${warning}
   ${lineage}
   ${contact}
   ${body}

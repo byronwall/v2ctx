@@ -6,7 +6,7 @@ import { ensureModel } from "./models.js";
 import { resolveInputs, buildTimeline } from "./sources.js";
 import { buildContactSheet } from "./contact.js";
 import { parseTranscript, writeIndex, writeHtmlReport } from "./report.js";
-import { exec, log, step, done, info, fmtTime } from "./util.js";
+import { exec, log, step, done, info, warn, fmtTime } from "./util.js";
 
 const HELP = `
 video-to-context — turn screen recordings into a structured, digestible context
@@ -62,21 +62,46 @@ function parseArgs(argv) {
     const a = argv[i];
     const next = () => argv[++i];
     switch (a) {
-      case "-h": case "--help": opts.help = true; break;
-      case "-o": case "--output": opts.output = next(); break;
-      case "-m": case "--model": opts.model = next(); break;
-      case "-l": case "--language": opts.language = next(); break;
-      case "--interval": opts.interval = parseFloat(next()); break;
-      case "--contact": opts.contact = parseInt(next(), 10); break;
+      case "-h":
+      case "--help":
+        opts.help = true;
+        break;
+      case "-o":
+      case "--output":
+        opts.output = next();
+        break;
+      case "-m":
+      case "--model":
+        opts.model = next();
+        break;
+      case "-l":
+      case "--language":
+        opts.language = next();
+        break;
+      case "--interval":
+        opts.interval = parseFloat(next());
+        break;
+      case "--contact":
+        opts.contact = parseInt(next(), 10);
+        break;
       case "--scene": {
         const peek = argv[i + 1];
         opts.scene = peek && !peek.startsWith("-") ? parseFloat(next()) : 0.08;
         break;
       }
-      case "--no-source": opts.copySource = false; break;
-      case "--no-frames": opts.frames = false; break;
-      case "--no-transcript": opts.transcript = false; break;
-      case "-f": case "--force": opts.force = true; break;
+      case "--no-source":
+        opts.copySource = false;
+        break;
+      case "--no-frames":
+        opts.frames = false;
+        break;
+      case "--no-transcript":
+        opts.transcript = false;
+        break;
+      case "-f":
+      case "--force":
+        opts.force = true;
+        break;
       default:
         if (a.startsWith("-")) throw new Error(`Unknown option: ${a}`);
         if (opts.input) throw new Error(`Unexpected argument: ${a}`);
@@ -95,11 +120,18 @@ export async function run(argv) {
 
   // 0. Resolve tools first so we fail fast with install hints.
   const { ffmpeg, ffprobe } = await findFfmpeg();
-  const whisper = opts.transcript ? await findWhisper() : null;
 
   // 1. Resolve inputs → ordered source list → combined timeline.
   const { mode, dir, videos } = await resolveInputs(opts.input);
   const { sources, totalDuration } = await buildTimeline(ffprobe, videos);
+  const audioSources = sources.filter((s) => s.hasAudio);
+  const hasAudio = audioSources.length > 0;
+  const noAudioWarning = opts.transcript
+    ? "No audio stream was found, so no transcript is available."
+    : "No audio stream was found; skipping audio output.";
+  const transcriptUnavailable =
+    opts.transcript && !hasAudio ? noAudioWarning : null;
+  const whisper = opts.transcript && hasAudio ? await findWhisper() : null;
 
   const title =
     mode === "file"
@@ -107,10 +139,13 @@ export async function run(argv) {
       : path.basename(dir);
   const outDir = path.resolve(opts.output || `${title}-context`);
 
-  const exists = await fs.stat(outDir).then(() => true).catch(() => false);
+  const exists = await fs
+    .stat(outDir)
+    .then(() => true)
+    .catch(() => false);
   if (exists && !opts.force) {
     throw new Error(
-      `Output directory already exists: ${outDir}\nUse --force to overwrite, or -o to choose another.`
+      `Output directory already exists: ${outDir}\nUse --force to overwrite, or -o to choose another.`,
     );
   }
   if (exists) await fs.rm(outDir, { recursive: true, force: true });
@@ -128,12 +163,15 @@ export async function run(argv) {
   if (sources.length > 1) {
     info(`${sources.length} sources, ${fmtTime(totalDuration)} combined:`);
     for (const s of sources) {
-      info(`  ${s.index + 1}. ${s.name}  (${fmtTime(s.duration)} @ ${fmtTime(s.offset)})`);
+      info(
+        `  ${s.index + 1}. ${s.name}  (${fmtTime(s.duration)} @ ${fmtTime(s.offset)})`,
+      );
     }
   }
   log("");
 
-  const modelPath = opts.transcript ? await ensureModel(opts.model) : null;
+  const modelPath =
+    opts.transcript && hasAudio ? await ensureModel(opts.model) : null;
   const tmp = await fs.mkdtemp(path.join(os.tmpdir(), "v2c-"));
 
   try {
@@ -149,10 +187,20 @@ export async function run(argv) {
     }
 
     // 3. Audio — extract each source to wav, then concatenate.
-    step("Extracting audio (mono 16 kHz WAV)");
     const audioPath = path.join(dirs.audio, "audio.wav");
-    await extractAudio(ffmpeg, sources, audioPath, tmp);
-    done(path.relative(outDir, audioPath));
+    if (hasAudio) {
+      step("Extracting audio (mono 16 kHz WAV)");
+      await extractAudio(ffmpeg, sources, audioPath, tmp);
+      done(path.relative(outDir, audioPath));
+      if (audioSources.length < sources.length) {
+        warn(
+          `${sources.length - audioSources.length} source(s) had no audio; inserted silence to preserve timeline alignment.`,
+        );
+      }
+    } else {
+      await fs.rmdir(dirs.audio).catch(() => {});
+      warn(noAudioWarning);
+    }
 
     // 4. Frames — extract per source, then merge onto the combined timeline.
     let frames = [];
@@ -170,18 +218,27 @@ export async function run(argv) {
 
     // 5. Transcription on the combined audio.
     let segments = [];
-    if (opts.transcript) {
+    if (opts.transcript && hasAudio) {
       step(`Transcribing with whisper.cpp (model: ${opts.model})`);
       info("this can take a while on longer videos…");
       const prefix = path.join(dirs.transcript, "transcript");
       const wargs = [
-        "-m", modelPath, "-f", audioPath,
-        "-otxt", "-osrt", "-oj", "-of", prefix,
+        "-m",
+        modelPath,
+        "-f",
+        audioPath,
+        "-otxt",
+        "-osrt",
+        "-oj",
+        "-of",
+        prefix,
       ];
       if (opts.language) wargs.push("-l", opts.language);
       await exec(whisper.bin, wargs, { quiet: false });
       segments = await parseTranscript(`${prefix}.json`);
-      done(`${segments.length} segments → transcript/transcript.{txt,srt,json}`);
+      done(
+        `${segments.length} segments → transcript/transcript.{txt,srt,json}`,
+      );
     } else {
       await fs.rmdir(dirs.transcript).catch(() => {});
     }
@@ -189,7 +246,9 @@ export async function run(argv) {
     // 6. Contact sheet.
     let contactSheetFile = null;
     if (opts.frames && opts.contact > 0 && frames.length) {
-      step(`Building contact sheet (${Math.min(opts.contact, frames.length)} frames)`);
+      step(
+        `Building contact sheet (${Math.min(opts.contact, frames.length)} frames)`,
+      );
       const out = path.join(outDir, "contact_sheet.jpg");
       await buildContactSheet(ffmpeg, frames, dirs.frames, out, {
         count: opts.contact,
@@ -206,17 +265,40 @@ export async function run(argv) {
       .replace("T", " ")
       .slice(0, 16);
     await writeIndex({
-      outDir, title, sources, totalDuration, frames, opts,
+      outDir,
+      title,
+      sources,
+      totalDuration,
+      frames,
+      opts,
       hasContactSheet: !!contactSheetFile,
+      transcriptUnavailable,
     });
     await writeHtmlReport({
-      outDir, title, sources, totalDuration, frames, segments, opts,
-      contactSheetFile, generated,
+      outDir,
+      title,
+      sources,
+      totalDuration,
+      frames,
+      segments,
+      opts,
+      contactSheetFile,
+      generated,
+      transcriptUnavailable,
     });
     done("index.md, report.html");
 
     // 8. Agent-friendly manifest.
-    await printManifest({ outDir, dirs, sources, frames, opts, contactSheetFile, audioPath });
+    await printManifest({
+      outDir,
+      dirs,
+      sources,
+      frames,
+      opts,
+      contactSheetFile,
+      audioPath,
+      hasAudio,
+    });
   } finally {
     await fs.rm(tmp, { recursive: true, force: true });
   }
@@ -226,11 +308,34 @@ async function extractAudio(ffmpeg, sources, audioPath, tmp) {
   const wavs = [];
   for (const s of sources) {
     const w = path.join(tmp, `audio_${s.index}.wav`);
-    await exec(ffmpeg, [
-      "-y", "-i", s.path,
-      "-vn", "-acodec", "pcm_s16le", "-ar", "16000", "-ac", "1",
-      w,
-    ]);
+    if (s.hasAudio) {
+      await exec(ffmpeg, [
+        "-y",
+        "-i",
+        s.path,
+        "-vn",
+        "-acodec",
+        "pcm_s16le",
+        "-ar",
+        "16000",
+        "-ac",
+        "1",
+        w,
+      ]);
+    } else {
+      await exec(ffmpeg, [
+        "-y",
+        "-f",
+        "lavfi",
+        "-i",
+        "anullsrc=channel_layout=mono:sample_rate=16000",
+        "-t",
+        String(s.duration || 0),
+        "-acodec",
+        "pcm_s16le",
+        w,
+      ]);
+    }
     wavs.push(w);
   }
   if (wavs.length === 1) {
@@ -241,10 +346,19 @@ async function extractAudio(ffmpeg, sources, audioPath, tmp) {
   await fs.writeFile(
     listFile,
     wavs.map((w) => `file '${w.replace(/'/g, "'\\''")}'`).join("\n"),
-    "utf8"
+    "utf8",
   );
   await exec(ffmpeg, [
-    "-y", "-f", "concat", "-safe", "0", "-i", listFile, "-c", "copy", audioPath,
+    "-y",
+    "-f",
+    "concat",
+    "-safe",
+    "0",
+    "-i",
+    listFile,
+    "-c",
+    "copy",
+    audioPath,
   ]);
 }
 
@@ -275,45 +389,84 @@ async function extractFrames(ffmpeg, sources, framesDir, tmp, opts) {
 
 async function extractInterval(ffmpeg, input, framesDir, interval) {
   await exec(ffmpeg, [
-    "-y", "-i", input, "-vf", `fps=1/${interval}`, "-q:v", "2",
+    "-y",
+    "-i",
+    input,
+    "-vf",
+    `fps=1/${interval}`,
+    "-q:v",
+    "2",
     path.join(framesDir, "frame_%04d.jpg"),
   ]);
-  const files = (await fs.readdir(framesDir)).filter((f) => f.endsWith(".jpg")).sort();
+  const files = (await fs.readdir(framesDir))
+    .filter((f) => f.endsWith(".jpg"))
+    .sort();
   return files.map((file, idx) => ({ file, time: idx * interval }));
 }
 
 async function extractScene(ffmpeg, input, framesDir, threshold) {
   const { stderr } = await exec(ffmpeg, [
-    "-y", "-i", input,
-    "-vf", `select='gt(scene,${threshold})',showinfo`,
-    "-vsync", "vfr", "-q:v", "2",
+    "-y",
+    "-i",
+    input,
+    "-vf",
+    `select='gt(scene,${threshold})',showinfo`,
+    "-vsync",
+    "vfr",
+    "-q:v",
+    "2",
     path.join(framesDir, "scene_%04d.jpg"),
   ]);
-  const times = [...stderr.matchAll(/pts_time:([0-9.]+)/g)].map((m) => parseFloat(m[1]));
-  const files = (await fs.readdir(framesDir)).filter((f) => f.endsWith(".jpg")).sort();
+  const times = [...stderr.matchAll(/pts_time:([0-9.]+)/g)].map((m) =>
+    parseFloat(m[1]),
+  );
+  const files = (await fs.readdir(framesDir))
+    .filter((f) => f.endsWith(".jpg"))
+    .sort();
   return files.map((file, idx) => ({ file, time: times[idx] ?? null }));
 }
 
-async function printManifest({ outDir, dirs, sources, frames, opts, contactSheetFile, audioPath }) {
+async function printManifest({
+  outDir,
+  dirs,
+  sources,
+  frames,
+  opts,
+  contactSheetFile,
+  audioPath,
+  hasAudio,
+}) {
   const produced = [["index", path.join(outDir, "index.md")]];
   produced.push(["report", path.join(outDir, "report.html")]);
-  if (contactSheetFile) produced.push(["contact_sheet", path.join(outDir, contactSheetFile)]);
-  if (opts.transcript) {
+  if (contactSheetFile)
+    produced.push(["contact_sheet", path.join(outDir, contactSheetFile)]);
+  if (opts.transcript && hasAudio) {
     for (const ext of ["txt", "srt", "json"]) {
-      produced.push([`transcript_${ext}`, path.join(dirs.transcript, `transcript.${ext}`)]);
+      produced.push([
+        `transcript_${ext}`,
+        path.join(dirs.transcript, `transcript.${ext}`),
+      ]);
     }
   }
-  produced.push(["audio", audioPath]);
+  if (hasAudio) produced.push(["audio", audioPath]);
   if (opts.frames) {
-    for (const f of frames) produced.push(["frame", path.join(dirs.frames, f.file)]);
+    for (const f of frames)
+      produced.push(["frame", path.join(dirs.frames, f.file)]);
   }
   if (opts.copySource) {
-    for (const s of sources) produced.push(["source", path.join(dirs.source, s.name)]);
+    for (const s of sources)
+      produced.push(["source", path.join(dirs.source, s.name)]);
   }
 
   const existing = [];
   for (const [kind, p] of produced) {
-    if (await fs.stat(p).then(() => true).catch(() => false)) existing.push([kind, p]);
+    if (
+      await fs
+        .stat(p)
+        .then(() => true)
+        .catch(() => false)
+    )
+      existing.push([kind, p]);
   }
 
   log(`\n\x1b[32m✓ Done.\x1b[0m  Context package ready at:\n  ${outDir}\n`);
