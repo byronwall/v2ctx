@@ -19,6 +19,11 @@ export async function findFfmpeg() {
     );
   }
   const ffprobe = await which("ffprobe");
+  if (!ffprobe) {
+    throw new Error(
+      "ffprobe not found. Install it with:\n    brew install ffmpeg"
+    );
+  }
   return { ffmpeg, ffprobe };
 }
 

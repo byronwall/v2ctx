@@ -1,7 +1,7 @@
 {
   "name": "video-to-context",
   "version": "1.0.0",
-  "description": "Turn a screen recording into a structured context package (transcript + screenshots + index) using local FFmpeg and whisper.cpp — no API calls.",
+  "description": "Turn recordings or audio memos into structured context packages using local FFmpeg and whisper.cpp — no API calls.",
   "type": "module",
   "bin": {
     "video-to-context": "bin/video-to-context.js",

@@ -11,6 +11,13 @@ function esc(s) {
     .replace(/"/g, "&quot;");
 }
 
+function mediaKind(source) {
+  if (source.hasAudio && source.hasVideo) return "audio+video";
+  if (source.hasVideo) return "video";
+  if (source.hasAudio) return "audio";
+  return "unknown";
+}
+
 /** Parse whisper.cpp JSON into [{ t (sec), text }]. */
 export async function parseTranscript(jsonPath) {
   try {
@@ -50,11 +57,11 @@ export async function writeIndex({
   L.push("");
 
   L.push(`## Sources / lineage\n`);
-  L.push(`| # | File | Starts at | Duration |`);
-  L.push(`|---|------|-----------|----------|`);
+  L.push(`| # | File | Type | Starts at | Duration |`);
+  L.push(`|---|------|------|-----------|----------|`);
   for (const s of sources) {
     L.push(
-      `| ${s.index + 1} | \`${s.name}\` | ${fmtTime(s.offset)} | ${fmtTime(
+      `| ${s.index + 1} | \`${s.name}\` | ${mediaKind(s)} | ${fmtTime(s.offset)} | ${fmtTime(
         s.duration,
       )} |`,
     );
@@ -123,13 +130,14 @@ export async function writeHtmlReport({
     <section>
       <h2>Sources &amp; lineage</h2>
       <table class="lineage">
-        <thead><tr><th>#</th><th>File</th><th>Starts at</th><th>Duration</th></tr></thead>
+        <thead><tr><th>#</th><th>File</th><th>Type</th><th>Starts at</th><th>Duration</th></tr></thead>
         <tbody>
         ${sources
           .map(
             (s) => `<tr>
             <td>${s.index + 1}</td>
             <td><code>${esc(s.name)}</code></td>
+            <td>${esc(mediaKind(s))}</td>
             <td>${fmtTime(s.offset)}</td>
             <td>${fmtTime(s.duration)}</td>
           </tr>`,
@@ -163,7 +171,7 @@ export async function writeHtmlReport({
       <p class="dim">Each screenshot is paired with the narration spoken while it was on screen.</p>
       ${frames
         .map((f, i) => {
-          const start = i === 0 ? -Infinity : f.globalTime;
+          const start = f.globalTime;
           const end =
             i + 1 < frames.length ? frames[i + 1].globalTime : Infinity;
           const segs = segments.filter((s) => s.t >= start && s.t < end);
@@ -238,7 +246,7 @@ export async function writeHtmlReport({
 <head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
-<title>${esc(title)} — video context</title>
+<title>${esc(title)} — media context</title>
 <style>
   :root { --bg:#0f1115; --panel:#171a21; --fg:#e6e8eb; --dim:#9aa3af; --accent:#6ea8fe; --line:#2a2f3a; }
   * { box-sizing: border-box; }
