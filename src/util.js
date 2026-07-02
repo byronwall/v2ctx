@@ -1,4 +1,6 @@
 import { spawn } from "node:child_process";
+import { createInterface } from "node:readline/promises";
+import { stdin as input, stdout as output } from "node:process";
 
 const c = {
   reset: "\x1b[0m",
@@ -27,6 +29,20 @@ export function info(msg) {
 
 export function warn(msg) {
   console.log(`${c.yellow}!${c.reset} ${msg}`);
+}
+
+export async function confirm(question, { defaultYes = false } = {}) {
+  if (!input.isTTY || !output.isTTY) return null;
+
+  const suffix = defaultYes ? " [Y/n] " : " [y/N] ";
+  const rl = createInterface({ input, output });
+  try {
+    const answer = (await rl.question(`${question}${suffix}`)).trim().toLowerCase();
+    if (!answer) return defaultYes;
+    return answer === "y" || answer === "yes";
+  } finally {
+    rl.close();
+  }
 }
 
 /**

@@ -19,14 +19,30 @@ Prerequisites (Homebrew):
 brew install ffmpeg whisper-cpp
 ```
 
-Then install the CLI globally:
+If either dependency is missing, the CLI will offer to install it for you with a
+`yes/no` prompt. Use `-y` or `--yes` to approve dependency installation without
+prompting.
+
+Run it directly from npm:
 
 ```bash
-cd video-to-context
-npm install -g .      # or: npm link
+npx v2ctx
 ```
 
-This exposes two commands: `video-to-context` and the short alias `v2c`.
+Or install it globally:
+
+```bash
+npm install -g v2ctx
+```
+
+The published package exposes three commands: `v2ctx`, `v2c`, and
+`video-to-context`.
+
+For local development from this repo:
+
+```bash
+npm install -g .      # or: npm link
+```
 
 Whisper models are downloaded and cached automatically on first use under
 `~/.cache/video-to-context/models/`.
@@ -34,7 +50,7 @@ Whisper models are downloaded and cached automatically on first use under
 ## Usage
 
 ```bash
-video-to-context [input] [options]
+npx v2ctx [input] [options]
 ```
 
 `input` may be:
@@ -44,8 +60,9 @@ video-to-context [input] [options]
   into one timeline, with full lineage back to each source file
 - **omitted** — defaults to the current directory
 
-So you can `cd ~/Desktop && video-to-context` to bundle every recording on your
-Desktop into one digestible package.
+So you can `cd ~/Desktop && npx v2ctx` to bundle every recording on your Desktop
+into one digestible package. If installed globally, use `v2ctx` in place of
+`npx v2ctx`.
 
 Supported audio-only inputs include common voice memo formats such as `.m4a`,
 `.mp3`, `.wav`, `.aac`, `.caf`, `.flac`, `.ogg`, `.opus`, `.aif`, and `.aiff`.
@@ -54,7 +71,7 @@ Audio-only runs skip screenshot and contact-sheet generation automatically.
 For Apple Voice Memos, use the preset:
 
 ```bash
-video-to-context --voice-memos
+npx v2ctx --voice-memos
 ```
 
 It auto-detects the likely Voice Memos folder, writes to
@@ -62,8 +79,8 @@ It auto-detects the likely Voice Memos folder, writes to
 `report.html` when it finishes. You can still override pieces:
 
 ```bash
-video-to-context --voice-memos -m medium --no-open
-video-to-context --voice-memos /path/to/Voice\ Memos -o ~/Documents/memos-context
+npx v2ctx --voice-memos -m medium --no-open
+npx v2ctx --voice-memos /path/to/Voice\ Memos -o ~/Documents/memos-context
 ```
 
 If macOS reports that likely Voice Memos folders exist but cannot be read,
@@ -89,6 +106,7 @@ without extracting audio or transcribing again. Use `--force` to rebuild.
 | `--no-source` | Don't copy source media into the package |
 | `--no-frames` | Skip screenshot extraction |
 | `--no-transcript` | Skip transcription |
+| `-y, --yes` | Answer yes to dependency installation prompts |
 | `-f, --force` | Overwrite an existing output directory |
 | `-h, --help` | Show help |
 
@@ -96,22 +114,22 @@ without extracting audio or transcribing again. Use `--force` to rebuild.
 
 ```bash
 # Apple Voice Memos, one reusable local context package
-video-to-context --voice-memos
+npx v2ctx --voice-memos
 
 # Every media file in the current folder, concatenated with lineage
-video-to-context
+npx v2ctx
 
 # A single recording
-video-to-context demo.mov
+npx v2ctx demo.mov
 
 # Audio-only voice memos, higher-accuracy transcript
-video-to-context ~/Desktop/voice-memos -m medium --no-source
+npx v2ctx ~/Desktop/voice-memos -m medium --no-source
 
 # Concatenate every media file on the Desktop, higher-accuracy transcript
-video-to-context ~/Desktop -m medium
+npx v2ctx ~/Desktop -m medium
 
 # Mostly-static UI: only capture meaningful screen changes
-video-to-context demo.mov --scene 0.05 -o ./demo-context
+npx v2ctx demo.mov --scene 0.05 -o ./demo-context
 ```
 
 ## Output structure

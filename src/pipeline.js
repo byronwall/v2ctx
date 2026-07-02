@@ -1,7 +1,7 @@
 import fs from "node:fs/promises";
 import path from "node:path";
 import os from "node:os";
-import { findFfmpeg, findWhisper } from "./tools.js";
+import { ensureLocalTools, findFfmpeg, findWhisper } from "./tools.js";
 import { ensureModel } from "./models.js";
 import { resolveInputs, buildTimeline } from "./sources.js";
 import { buildContactSheet } from "./contact.js";
@@ -40,6 +40,7 @@ OPTIONS
       --no-source        Don't copy source media into the package
       --no-frames        Skip screenshot extraction
       --no-transcript    Skip transcription
+  -y, --yes              Answer yes to dependency installation prompts
   -f, --force            Overwrite an existing output directory
   -h, --help             Show this help
 
@@ -73,6 +74,7 @@ function parseArgs(argv) {
     openReport: false,
     recursive: false,
     force: false,
+    yes: false,
   };
   for (let i = 0; i < argv.length; i++) {
     const a = argv[i];
@@ -124,6 +126,10 @@ function parseArgs(argv) {
       case "--no-transcript":
         opts.transcript = false;
         break;
+      case "-y":
+      case "--yes":
+        opts.yes = true;
+        break;
       case "-f":
       case "--force":
         opts.force = true;
@@ -145,6 +151,7 @@ export async function run(argv) {
   }
 
   step("Checking local tools");
+  await ensureLocalTools({ transcript: opts.transcript, yes: opts.yes });
   const { ffmpeg, ffprobe } = await findFfmpeg();
   done(`ffmpeg: ${ffmpeg}`);
   const whisper = opts.transcript ? await findWhisper() : null;

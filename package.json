@@ -1,11 +1,20 @@
 {
-  "name": "video-to-context",
+  "name": "v2ctx",
   "version": "1.0.0",
   "description": "Turn recordings or audio memos into structured context packages using local FFmpeg and whisper.cpp — no API calls.",
   "type": "module",
+  "scripts": {
+    "publish:check": "npm pack --dry-run",
+    "publish:dry-run": "npm publish --dry-run --access public",
+    "publish:public": "npm publish --access public"
+  },
   "bin": {
+    "v2ctx": "bin/video-to-context.js",
     "video-to-context": "bin/video-to-context.js",
     "v2c": "bin/video-to-context.js"
+  },
+  "publishConfig": {
+    "access": "public"
   },
   "files": [
     "bin",
