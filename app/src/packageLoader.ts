@@ -13,6 +13,7 @@ export async function loadPackageFromFileList(files: FileList): Promise<MemoPack
     path: file.webkitRelativePath || file.name,
     file,
     size: file.size,
+    mtimeMs: file.lastModified,
   }));
 
   const name = inferPackageName(loaded);

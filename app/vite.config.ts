@@ -5,6 +5,7 @@ import fsp from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
 import { continueAnalysisPackage } from "../cli/analysis.js";
+import { run } from "../cli/pipeline.js";
 
 export default defineConfig({
   plugins: [solid(), voiceMemosApi()],
@@ -12,6 +13,7 @@ export default defineConfig({
 
 const VOICE_MEMOS_ROOT =
   process.env.V2C_VOICE_MEMOS_ROOT || path.join(os.homedir(), ".v2c-voice-memos");
+let voiceMemosRefreshPromise = null;
 
 function voiceMemosApi() {
   return {
@@ -23,6 +25,29 @@ function voiceMemosApi() {
           if (url.pathname === "/api/voice-memos") {
             const library = await readVoiceMemosLibrary();
             sendJson(res, library);
+            return;
+          }
+
+          if (url.pathname === "/api/voice-memos/refresh") {
+            if (req.method !== "POST") {
+              sendJson(res, { error: "Method not allowed" }, 405);
+              return;
+            }
+            const requestStarted = Date.now();
+            console.log("[v2ctx-ui] voice memo refresh requested");
+            if (!voiceMemosRefreshPromise) {
+              voiceMemosRefreshPromise = run(["voice-memos", "--no-open", "--no-codex"]).finally(() => {
+                voiceMemosRefreshPromise = null;
+              });
+            } else {
+              console.log("[v2ctx-ui] joining in-flight voice memo refresh");
+            }
+            await voiceMemosRefreshPromise;
+            const library = await readVoiceMemosLibrary();
+            console.log(
+              `[v2ctx-ui] voice memo refresh complete in ${formatDuration(Date.now() - requestStarted)}`,
+            );
+            sendJson(res, { library });
             return;
           }
 
@@ -145,6 +170,7 @@ async function listPackageFiles(packageDir) {
       output.push({
         path: relativePath,
         size: stat.size,
+        mtimeMs: Math.trunc(stat.mtimeMs),
         url: `/api/asset/${encodeURIComponent(isRootPackage ? "voice-memos-root" : path.basename(packageDir))}/${relativePath
           .split(path.sep)
           .map(encodeURIComponent)

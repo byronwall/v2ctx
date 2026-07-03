@@ -76,6 +76,7 @@ export type LoadedFile = {
   file?: File;
   url?: string;
   size?: number;
+  mtimeMs?: number;
 };
 
 export type PackageStatus =
