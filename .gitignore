@@ -1,2 +1,7 @@
 .DS_Store
 tmp/
+node_modules/
+app/node_modules/
+app/dist/
+app/tsconfig.tsbuildinfo
+.env
