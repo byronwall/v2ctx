@@ -181,3 +181,39 @@ Technical implementation: Maintain repo metadata and use project routing to atta
 If the goal includes tweets and blog posts, the system should learn how the user sounds when cleaned up, not just transcribe raw speech. It should preserve directness, technical specificity, and strong opinions while removing rambling. Over time, it can generate drafts that feel like the user rather than generic summaries. This is especially useful for turning spoken commentary into publishable writing.
 
 Technical implementation: Build a small corpus of approved cleaned excerpts, tweets, and blog paragraphs. Use that corpus as retrieval context or style examples when rewriting future transcript segments.
+
+## 31. Detect Spoken Mannerisms
+
+The transcript should be analyzed for recurring spoken habits that are part of the user's natural voice. These might include phrases like "what this comes down to", "the thing is", "my suspicion is", "you do much better to", or "that gets you into the world of". Some of these mannerisms should survive into writing because they make the piece sound personal. Others should be softened because they are useful in speech but repetitive on the page.
+
+Technical implementation: Extract repeated n-grams, discourse markers, and sentence openers across transcripts. Classify each as `keep`, `limit`, or `remove_in_writing`, then use that inventory during rewrite and editing passes.
+
+## 32. Build An Anti-AI Style Filter
+
+Generated blog posts often drift into generic AI prose: tidy transitions, balanced-but-bland caveats, inflated conclusions, and phrases the user would never say. The system should learn those patterns and flag them before a post is accepted. The goal is not to make writing sound like raw transcript, but to remove the overly polished synthetic layer. This would make blog drafts feel more like cleaned-up spoken thinking.
+
+Technical implementation: Compare generated drafts against a profile of approved user writing and spoken-derived excerpts. Score sentences for AI-ish phrasing, generic claims, unsupported flourish, and vocabulary mismatch, then suggest replacements grounded in transcript language.
+
+## 33. Preserve Argument Rhythm
+
+The user's spoken style often builds by considering a practical case, naming the tradeoff, then backing into a general principle. That rhythm is more valuable than exact wording. Blog post generation should preserve that movement instead of flattening everything into standard essay structure. This helps the writing keep the user's engineering judgment and exploratory feel.
+
+Technical implementation: Detect rhetorical moves in transcript segments, such as example, objection, tradeoff, principle, caveat, and implementation note. Use those moves as an outline constraint when converting speech into blog sections.
+
+## 34. Create A Personal Phrasebook
+
+A phrasebook would collect characteristic words, transitions, and evaluative language from the transcripts. This is different from a quote bank because it captures reusable connective tissue rather than publishable statements. The phrasebook can help rewritten posts sound consistent without forcing exact repetition. It can also identify phrases that are overused and should be rationed.
+
+Technical implementation: Build a ranked phrase inventory with examples, topic associations, and usage counts. During drafting, retrieve a small number of relevant phrases as style guidance and track repeated use within the generated post.
+
+## 35. Align Blog Drafts To Source Evidence
+
+One cause of AI hallucination is when a draft invents claims, examples, or certainty that were not present in the original commentary. Each blog paragraph should be traceable back to a transcript segment, extracted claim, or explicit follow-up note. This forces the writing to stay grounded in what was actually said. It also makes review easier because unsupported paragraphs can be flagged.
+
+Technical implementation: Require each generated paragraph to carry source IDs for the transcript chunks or extracted claims it relies on. Run a verification pass that marks unsupported claims, over-specific additions, and statements whose confidence is stronger than the source.
+
+## 36. Distinguish Spoken Fillers From Voice
+
+Raw speech contains false starts, loops, filler, and repeated scaffolding. Some of that should be removed, but not all of it is junk. The system should distinguish between mechanical filler and genuine voice markers so editing does not sand everything down. This is especially important for keeping technical posts direct and personal while still making them readable.
+
+Technical implementation: Label transcript tokens and phrases as filler, hesitation, structural marker, emphasis, or stylistic marker. Use different rewrite rules for each class instead of applying a single cleanup pass to all disfluencies.

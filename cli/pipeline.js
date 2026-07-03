@@ -1,20 +1,32 @@
 import fs from "node:fs/promises";
 import path from "node:path";
 import os from "node:os";
-import { ensureLocalTools, findFfmpeg, findWhisper } from "./tools.js";
+import { ensureLocalTools, findFfmpeg, findParakeet, findWhisper } from "./tools.js";
 import { ensureModel } from "./models.js";
 import { resolveInputs, buildTimeline } from "./sources.js";
 import { buildContactSheet } from "./contact.js";
 import { parseTranscript, writeIndex, writeHtmlReport } from "./report.js";
 import { exec, log, step, done, info, warn, fmtTime } from "./util.js";
+import {
+  analyzePackage,
+  continueAnalysisPackage,
+  deriveArtifacts,
+  DEFAULT_LLM_MODEL,
+  DEFAULT_LLM_PROVIDER,
+  defaultVoiceMemoOutput,
+  getPackageStatus,
+  importCodexResults,
+  resetAnalysisAssets,
+} from "./analysis.js";
 
 const HELP = `
 video-to-context — turn screen recordings or audio memos into a structured,
 digestible context package (transcript + screenshots when video is present +
-contact sheet + HTML report) using local FFmpeg and whisper.cpp. No API calls,
-no uploads.
+contact sheet + HTML report) using local FFmpeg and Parakeet/whisper.cpp.
+Optional transcript analysis uses the OpenAI API only when --run-llm is passed.
 
 USAGE
+  video-to-context <command> [options]
   video-to-context [input] [options]
   v2c [input] [options]
 
@@ -22,11 +34,23 @@ USAGE
   concatenated into one timeline with lineage back to each source), or omitted
   (defaults to the current directory).
 
+COMMANDS
+  voice-memos                Main workflow: process new Apple Voice Memos,
+                             run LLM analysis when requested, and skip completed ones
+  analyze <context-package>  Create analysis/segments.json and
+                             analysis/session-digest.md from a transcript
+  analyze --voice-memos      Process new/unprocessed Apple Voice Memos, then
+                             analyze them
+
 OPTIONS
   -o, --output <dir>     Output directory (default: <name>-context)
-  -m, --model <name>     Whisper model: tiny(.en) base(.en) small(.en)
+      --transcriber <t>  Audio transcription backend: parakeet or whisper
+                         (default: parakeet)
+  -m, --model <name>     Whisper-only model: tiny(.en) base(.en) small(.en)
                          medium(.en) large-v3 large-v3-turbo, or a path to a
                          ggml-*.bin file (default: base.en)
+      --decoding <mode>  Parakeet decoding mode, e.g. greedy or beam
+      --beam-size <n>    Parakeet beam size when using beam decoding
   -l, --language <code>  Spoken language hint, e.g. en (default: auto)
       --interval <sec>   Seconds between screenshots (default: 10)
       --scene [thresh]   Scene-change detection instead of fixed interval
@@ -35,6 +59,18 @@ OPTIONS
       --voice-memos      Auto-detect Apple Voice Memos, write to
                          ~/.v2c-voice-memos, skip visuals/source copies, open
                          report.html when done
+      --prepare-codex    Advanced: write analysis/codex prompt packets
+      --codex-model <m>  Override Codex model (default: gpt-5.4-mini)
+      --force-analysis   With analyze, rebuild existing analysis files
+      --reset-analysis   Delete analysis assets before continuing
+      --import-codex     Advanced: validate and install Codex JSONL results
+      --from <jsonl>     With --import-codex, source JSONL to import
+      --derive           Advanced: derive tasks/claims/quotes/blog/review
+      --run-llm          Run provider-backed transcript analysis
+      --llm-provider <p> LLM provider (default: openai)
+      --llm-model <m>    LLM model (default: gpt-5.5)
+      --run-codex        With analyze, run Codex on prepared packets
+      --no-codex         In voice-memos, stop after preparing Codex packets
       --open             Open report.html when done
       --no-open          Don't open report.html
       --no-source        Don't copy source media into the package
@@ -49,12 +85,21 @@ Reruns are idempotent: if the output directory already contains a matching
 existing outputs and exits without transcribing again. Use --force to rebuild.
 
 EXAMPLES
+  video-to-context voice-memos           # main workflow for new Voice Memos
+  video-to-context voice-memos --run-llm # process transcripts with OpenAI
+  video-to-context voice-memos --transcriber whisper -m medium
+  video-to-context voice-memos --force  # reprocess audio + transcript
+  video-to-context voice-memos --reset-analysis
+  video-to-context voice-memos --no-codex # prepare packets, don't run model
+  video-to-context analyze ./demo-context --run-llm --derive
+  video-to-context analyze ./demo-context --prepare-codex --run-codex --derive
+  video-to-context analyze ./demo-context --import-codex --from ./results/segment-analysis.jsonl --derive
+  video-to-context analyze ./demo-context --prepare-codex
   video-to-context --voice-memos         # Apple Voice Memos → ~/.v2c-voice-memos
   video-to-context                       # all media files in the current folder
   video-to-context demo.mov
-  video-to-context voice-memos -m medium # transcribe audio-only recordings
   video-to-context ~/Library/Mobile\\ Documents/com~apple~CloudDocs/Voice\\ Memos -o ~/Documents/voice-memos-context
-  video-to-context ~/Desktop -m medium   # concatenate every media file on Desktop
+  video-to-context ~/Desktop --transcriber whisper -m medium
   video-to-context demo.mov --scene 0.05 -o ./demo-context
 `;
 
@@ -62,8 +107,11 @@ function parseArgs(argv) {
   const opts = {
     input: null,
     output: null,
+    transcriber: "parakeet",
     model: "base.en",
     language: null,
+    decoding: null,
+    beamSize: null,
     interval: 10,
     scene: null,
     contact: 25,
@@ -75,6 +123,13 @@ function parseArgs(argv) {
     recursive: false,
     force: false,
     yes: false,
+    codexModel: null,
+    from: null,
+    runCodex: null,
+    resetAnalysis: false,
+    runLlm: false,
+    llmProvider: DEFAULT_LLM_PROVIDER,
+    llmModel: DEFAULT_LLM_MODEL,
   };
   for (let i = 0; i < argv.length; i++) {
     const a = argv[i];
@@ -92,9 +147,18 @@ function parseArgs(argv) {
       case "--model":
         opts.model = next();
         break;
+      case "--transcriber":
+        opts.transcriber = next();
+        break;
       case "-l":
       case "--language":
         opts.language = next();
+        break;
+      case "--decoding":
+        opts.decoding = next();
+        break;
+      case "--beam-size":
+        opts.beamSize = parseInt(next(), 10);
         break;
       case "--interval":
         opts.interval = parseFloat(next());
@@ -104,6 +168,42 @@ function parseArgs(argv) {
         break;
       case "--voice-memos":
         opts.voiceMemos = true;
+        break;
+      case "--prepare-codex":
+        opts.prepareCodex = true;
+        break;
+      case "--codex-model":
+        opts.codexModel = next();
+        break;
+      case "--force-analysis":
+        opts.forceAnalysis = true;
+        break;
+      case "--reset-analysis":
+        opts.resetAnalysis = true;
+        break;
+      case "--import-codex":
+        opts.importCodex = true;
+        break;
+      case "--from":
+        opts.from = next();
+        break;
+      case "--derive":
+        opts.derive = true;
+        break;
+      case "--run-llm":
+        opts.runLlm = true;
+        break;
+      case "--llm-provider":
+        opts.llmProvider = next();
+        break;
+      case "--llm-model":
+        opts.llmModel = next();
+        break;
+      case "--run-codex":
+        opts.runCodex = true;
+        break;
+      case "--no-codex":
+        opts.runCodex = false;
         break;
       case "--open":
         opts.openReport = true;
@@ -140,22 +240,217 @@ function parseArgs(argv) {
         opts.input = a;
     }
   }
+  if (!["parakeet", "whisper"].includes(opts.transcriber)) {
+    throw new Error(`Unknown transcriber: ${opts.transcriber}. Use "parakeet" or "whisper".`);
+  }
+  if (opts.llmProvider !== "openai") {
+    throw new Error(`Unknown LLM provider: ${opts.llmProvider}. Use "openai".`);
+  }
   return opts;
 }
 
 export async function run(argv) {
+  const command = argv[0];
+  if (command === "analyze") {
+    await runAnalyze(argv.slice(1));
+    return;
+  }
+  if (command === "voice-memos") {
+    const opts = parseArgs(argv.slice(1));
+    opts.voiceMemos = true;
+    await runVoiceMemos(opts);
+    return;
+  }
+
   const opts = parseArgs(argv);
   if (opts.help) {
     log(HELP);
     return;
   }
+  await runCapture(opts);
+}
 
+async function runAnalyze(argv) {
+  const opts = parseArgs(argv);
+  if (opts.help) {
+    log(HELP);
+    return;
+  }
+  if (opts.voiceMemos) {
+    await runVoiceMemos(opts);
+    return;
+  }
+  if (!opts.input) {
+    throw new Error("Usage: v2c analyze <context-package> [--prepare-codex]");
+  }
+
+  if (opts.resetAnalysis) {
+    step(`Resetting analysis assets for ${opts.input}`);
+    const reset = await resetAnalysisAssets(opts.input);
+    done(reset.analysisDir);
+    opts.forceAnalysis = true;
+  }
+
+  if (opts.importCodex) {
+    step(`Importing Codex results for ${opts.input}`);
+    const imported = await importCodexResults(opts.input, opts);
+    done(`${imported.count} record(s) validated and installed`);
+    log(`  codex_result   ${imported.codexResultPath}`);
+    log(`  analysis       ${imported.analysisPath}`);
+  }
+
+  step(`Analyzing ${opts.input}`);
+  const result = await analyzePackage(opts.input, opts);
+  done(result.skipped ? "already analyzed" : `${result.count} segment(s)`);
+  log(`\n\x1b[1mAnalysis files:\x1b[0m`);
+  log(`  segments       ${result.segmentsPath}`);
+  log(`  digest         ${result.digestPath}`);
+  if (opts.prepareCodex) log(`  codex_packets  ${result.codexDir}`);
+  log("");
+
+  if (opts.runCodex === true && opts.prepareCodex) {
+    step(`Continuing Codex analysis for ${opts.input}`);
+    const continued = await continueAnalysisPackage(opts.input, opts);
+    done(`${continued.actions.join(", ") || "already complete"}`);
+    return;
+  }
+
+  if (opts.runLlm) {
+    step(`Running LLM transcript analysis for ${opts.input}`);
+    const continued = await continueAnalysisPackage(opts.input, opts);
+    done(`${continued.actions.join(", ") || "already complete"}`);
+    if (continued.status.stage !== "derived") {
+      warn(`${opts.input} waiting at ${continued.status.stage}`);
+      info(`next: ${describeNextAction(opts.input, continued.status)}`);
+    }
+    return;
+  }
+
+  if (opts.derive) {
+    step(`Deriving artifacts for ${opts.input}`);
+    const derived = await deriveArtifacts(opts.input);
+    done(
+      `${derived.tasks} task(s), ${derived.claims} claim(s), ${derived.quotes} quote(s)`,
+    );
+    log(`\n\x1b[1mDerived files:\x1b[0m`);
+    for (const file of derived.files) log(`  ${file}`);
+    log("");
+  }
+}
+
+async function runVoiceMemos(opts) {
+  if (opts.help) {
+    log(HELP);
+    return;
+  }
+  step("Locating Apple Voice Memos");
+  const input = opts.input ? expandHome(opts.input) : await findVoiceMemosDir();
+  const outputRoot = path.resolve(expandHome(opts.output) || defaultVoiceMemoOutput());
+  done(input);
+
+  step("Finding voice memo media files");
+  const { media } = await resolveInputs(input, {
+    recursive: true,
+    onProgress: (event) => {
+      if (event.type === "scan") info(`scanned ${event.dirs} folder(s); now ${event.dir}`);
+      else if (event.type === "media") info(`found ${event.files} media file(s) under ${event.dir}`);
+    },
+  });
+  done(`${media.length} memo file(s)`);
+
+  await fs.mkdir(outputRoot, { recursive: true });
+  const processed = [];
+  const completed = [];
+  const waiting = [];
+  const failed = [];
+  for (const file of media) {
+    const packageDir = uniquePackageDir(outputRoot, file);
+    try {
+      const before = await getPackageStatus(packageDir);
+      const needsLlmSummary = opts.runLlm && !before.exists.transcriptSummary;
+      if (
+        before.stage === "derived" &&
+        !needsLlmSummary &&
+        !opts.force &&
+        !opts.forceAnalysis &&
+        !opts.resetAnalysis
+      ) {
+        info(`${path.basename(packageDir)}: complete`);
+        completed.push(packageDir);
+        continue;
+      }
+
+      if (before.stage === "new" || opts.force) {
+        step(`Transcribing ${path.basename(file)}`);
+        await runCapture({
+          ...opts,
+          input: file,
+          output: packageDir,
+          voiceMemos: false,
+          copySource: false,
+          frames: false,
+          contact: 0,
+          recursive: false,
+          openReport: false,
+          noOpen: true,
+        });
+      } else {
+        step(`Continuing ${path.basename(packageDir)} (${before.stage})`);
+      }
+
+      if (opts.resetAnalysis) {
+        step(`Resetting analysis assets for ${path.basename(packageDir)}`);
+        await resetAnalysisAssets(packageDir);
+        opts.forceAnalysis = true;
+      }
+
+      const result = await continueAnalysisPackage(packageDir, opts);
+      const after = result.status;
+      if (after.stage === "derived") {
+        done(`${path.basename(packageDir)} complete: ${result.actions.join(", ") || "no work"}`);
+        processed.push(packageDir);
+      } else {
+        warn(`${path.basename(packageDir)} waiting at ${after.stage}`);
+        info(`next: ${describeNextAction(packageDir, after)}`);
+        waiting.push(packageDir);
+      }
+    } catch (err) {
+      warn(`${path.basename(packageDir)} failed: ${err.message}`);
+      failed.push({ packageDir, error: err.message });
+    }
+  }
+
+  log(`\n\x1b[32m✓ Done.\x1b[0m  Voice memo packages at:\n  ${outputRoot}\n`);
+  log(`\x1b[1mSummary:\x1b[0m`);
+  log(`  advanced        ${processed.length}`);
+  log(`  complete        ${completed.length}`);
+  log(`  waiting         ${waiting.length}`);
+  log(`  failed          ${failed.length}`);
+  if (waiting.length) {
+    log(`\n\x1b[1mWaiting packages:\x1b[0m`);
+    for (const packageDir of waiting) {
+      const status = await getPackageStatus(packageDir);
+      log(`  ${path.basename(packageDir).padEnd(38)} ${status.stage} → ${describeNextAction(packageDir, status)}`);
+    }
+  }
+  if (failed.length) {
+    log(`\n\x1b[1mFailed packages:\x1b[0m`);
+    for (const item of failed) log(`  ${path.basename(item.packageDir)}: ${item.error}`);
+  }
+  log("");
+}
+
+async function runCapture(opts) {
   step("Checking local tools");
-  await ensureLocalTools({ transcript: opts.transcript, yes: opts.yes });
+  await ensureLocalTools({
+    transcript: opts.transcript,
+    transcriber: opts.transcriber,
+    yes: opts.yes,
+  });
   const { ffmpeg, ffprobe } = await findFfmpeg();
   done(`ffmpeg: ${ffmpeg}`);
-  const whisper = opts.transcript ? await findWhisper() : null;
-  if (whisper) done(`whisper.cpp: ${whisper.path}`);
+  const transcriber = opts.transcript ? await findTranscriber(opts.transcriber) : null;
+  if (transcriber) done(`${transcriber.label}: ${transcriber.path}`);
 
   await applyVoiceMemosPreset(opts);
 
@@ -272,10 +567,14 @@ export async function run(argv) {
   }
   log("");
 
-  if (opts.transcript && hasAudio) step("Preparing whisper.cpp");
+  if (opts.transcript && hasAudio && opts.transcriber === "whisper") {
+    step("Preparing whisper.cpp");
+  }
   const modelPath =
-    opts.transcript && hasAudio ? await ensureModel(opts.model) : null;
-  if (opts.transcript && hasAudio) done(opts.model);
+    opts.transcript && hasAudio && opts.transcriber === "whisper"
+      ? await ensureModel(opts.model)
+      : null;
+  if (opts.transcript && hasAudio && opts.transcriber === "whisper") done(opts.model);
   const tmp = await fs.mkdtemp(path.join(os.tmpdir(), "v2c-"));
 
   try {
@@ -331,26 +630,27 @@ export async function run(argv) {
     // 5. Transcription on the combined audio.
     let segments = [];
     if (opts.transcript && hasAudio) {
-      step(`Transcribing with whisper.cpp (model: ${opts.model})`);
+      step(transcriptionStepLabel(opts));
       info("this can take a while on longer recordings...");
       const prefix = path.join(dirs.transcript, "transcript");
-      const wargs = [
-        "-m",
-        modelPath,
-        "-f",
-        audioPath,
-        "-otxt",
-        "-osrt",
-        "-oj",
-        "-of",
-        prefix,
-      ];
-      if (opts.language) wargs.push("-l", opts.language);
-      await exec(whisper.bin, wargs, { quiet: false });
+      if (opts.transcriber === "whisper") {
+        await transcribeWithWhisper(transcriber, {
+          audioPath,
+          prefix,
+          modelPath,
+          language: opts.language,
+        });
+      } else {
+        await transcribeWithParakeet(transcriber, {
+          audioPath,
+          transcriptDir: dirs.transcript,
+          tmp,
+          opts,
+        });
+      }
       segments = await parseTranscript(`${prefix}.json`);
-      done(
-        `${segments.length} segments → transcript/transcript.{txt,srt,json}`,
-      );
+      const exts = opts.transcriber === "parakeet" ? "txt,srt,vtt,json" : "txt,srt,json";
+      done(`${segments.length} segments → transcript/transcript.{${exts}}`);
     } else {
       await fs.rmdir(dirs.transcript).catch(() => {});
     }
@@ -595,6 +895,40 @@ function expandHome(value) {
   return value;
 }
 
+function uniquePackageDir(root, file) {
+  const stem = path.basename(file, path.extname(file));
+  const safe = stem
+    .replace(/[^a-z0-9._-]+/gi, "-")
+    .replace(/^-+|-+$/g, "")
+    .slice(0, 80) || "voice-memo";
+  return path.join(root, `${safe}-context`);
+}
+
+function describeNextAction(packageDir, status) {
+  switch (status.nextAction) {
+    case "run_llm":
+      return `v2c analyze ${packageDir} --run-llm --derive`;
+    case "run_codex":
+      return `v2c analyze ${packageDir} --prepare-codex --run-codex --derive`;
+    case "import_codex":
+      return `v2c analyze ${packageDir} --import-codex --derive`;
+    case "derive":
+      return `v2c analyze ${packageDir} --derive`;
+    case "prepare_codex":
+      return `v2c analyze ${packageDir} --prepare-codex`;
+    case "segment":
+      return `v2c analyze ${packageDir}`;
+    case "transcribe":
+      return `v2c voice-memos`;
+    default:
+      return "none";
+  }
+}
+
+async function pathExists(file) {
+  return fs.stat(file).then(() => true, () => false);
+}
+
 async function openReportIfRequested(openReport, outDir) {
   if (!openReport) return;
   const reportPath = path.join(outDir, "report.html");
@@ -630,7 +964,10 @@ async function buildRunManifest({ mode, dir, media, sources, totalDuration, opts
     },
     options: {
       model: opts.model,
+      transcriber: opts.transcriber,
       language: opts.language,
+      decoding: opts.decoding,
+      beamSize: opts.beamSize,
       interval: opts.interval,
       scene: opts.scene,
       contact: opts.contact,
@@ -650,6 +987,82 @@ async function buildRunManifest({ mode, dir, media, sources, totalDuration, opts
     })),
     totalDuration,
   };
+}
+
+async function findTranscriber(name) {
+  if (name === "whisper") {
+    const found = await findWhisper();
+    return { ...found, name, label: "whisper.cpp" };
+  }
+  const found = await findParakeet();
+  return { ...found, name, label: "parakeet-mlx" };
+}
+
+function transcriptionStepLabel(opts) {
+  if (opts.transcriber === "whisper") {
+    return `Transcribing with whisper.cpp (model: ${opts.model})`;
+  }
+  const decoding = opts.decoding ? `, decoding: ${opts.decoding}` : "";
+  return `Transcribing with parakeet-mlx${decoding}`;
+}
+
+async function transcribeWithWhisper(whisper, { audioPath, prefix, modelPath, language }) {
+  const wargs = [
+    "-m",
+    modelPath,
+    "-f",
+    audioPath,
+    "-otxt",
+    "-osrt",
+    "-oj",
+    "-of",
+    prefix,
+  ];
+  if (language) wargs.push("-l", language);
+  await exec(whisper.bin, wargs, { quiet: false });
+}
+
+async function transcribeWithParakeet(parakeet, { audioPath, transcriptDir, tmp, opts }) {
+  const parakeetOut = path.join(tmp, "parakeet-transcript");
+  await fs.mkdir(parakeetOut, { recursive: true });
+  const args = [
+    audioPath,
+    "--output-format",
+    "all",
+    "--output-dir",
+    parakeetOut,
+    "--chunk-duration",
+    "120",
+    "--overlap-duration",
+    "15",
+    "--verbose",
+  ];
+  if (opts.decoding) args.push("--decoding", opts.decoding);
+  if (opts.beamSize != null) args.push("--beam-size", String(opts.beamSize));
+  await exec(parakeet.bin, args, { quiet: false });
+
+  for (const ext of ["txt", "json", "srt", "vtt"]) {
+    const produced = await findTranscriptArtifact(parakeetOut, ext);
+    if (produced) {
+      await fs.copyFile(produced, path.join(transcriptDir, `transcript.${ext}`));
+    }
+  }
+}
+
+async function findTranscriptArtifact(dir, ext) {
+  const entries = await fs.readdir(dir, { withFileTypes: true });
+  const matches = [];
+  for (const entry of entries) {
+    const file = path.join(dir, entry.name);
+    if (entry.isDirectory()) {
+      const nested = await findTranscriptArtifact(file, ext);
+      if (nested) matches.push(nested);
+    } else if (entry.isFile() && entry.name.toLowerCase().endsWith(`.${ext}`)) {
+      matches.push(file);
+    }
+  }
+  matches.sort((a, b) => path.basename(a).localeCompare(path.basename(b)));
+  return matches[0] || null;
 }
 
 async function readJson(file) {
@@ -807,7 +1220,7 @@ async function printManifest({
   if (contactSheetFile)
     produced.push(["contact_sheet", path.join(outDir, contactSheetFile)]);
   if (opts.transcript && hasAudio) {
-    for (const ext of ["txt", "srt", "json"]) {
+    for (const ext of ["txt", "srt", "json", "vtt"]) {
       produced.push([
         `transcript_${ext}`,
         path.join(dirs.transcript, `transcript.${ext}`),

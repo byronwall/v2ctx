@@ -18,21 +18,44 @@ function mediaKind(source) {
   return "unknown";
 }
 
-/** Parse whisper.cpp JSON into [{ t (sec), text }]. */
+/** Parse transcription JSON into [{ t (sec), text }]. */
 export async function parseTranscript(jsonPath) {
   try {
     const raw = await fs.readFile(jsonPath, "utf8");
     const data = JSON.parse(raw);
-    const segs = data.transcription || [];
+    const segs =
+      data.transcription ||
+      data.sentences ||
+      data.segments ||
+      data.chunks ||
+      data.results ||
+      (Array.isArray(data) ? data : []);
     return segs
       .map((s) => ({
-        t: (s.offsets?.from ?? 0) / 1000,
-        text: (s.text || "").trim(),
+        t: segmentStartSeconds(s),
+        text: (s.text || s.transcript || s.sentence || "").trim(),
       }))
       .filter((s) => s.text);
   } catch {
     return [];
   }
+}
+
+function segmentStartSeconds(segment) {
+  if (typeof segment.offsets?.from === "number") return segment.offsets.from / 1000;
+  if (typeof segment.start_ms === "number") return segment.start_ms / 1000;
+
+  const value =
+    segment.start ??
+    segment.start_time ??
+    segment.timestamp?.[0] ??
+    segment.timestamps?.from ??
+    0;
+  if (typeof value === "number") {
+    return value > 10000 ? value / 1000 : value;
+  }
+  const parsed = parseFloat(value);
+  return Number.isFinite(parsed) ? parsed : 0;
 }
 
 /** Markdown index — quick, plain, agent-readable. */

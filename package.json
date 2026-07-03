@@ -1,9 +1,14 @@
 {
   "name": "v2ctx",
   "version": "1.0.0",
-  "description": "Turn recordings or audio memos into structured context packages using local FFmpeg and whisper.cpp — no API calls.",
+  "description": "Turn recordings or audio memos into structured context packages using local FFmpeg and Parakeet or whisper.cpp — no API calls.",
   "type": "module",
+  "workspaces": [
+    "app"
+  ],
   "scripts": {
+    "app:dev": "npm --prefix app run dev",
+    "app:build": "npm --prefix app run build",
     "publish:check": "npm pack --dry-run",
     "publish:dry-run": "npm publish --dry-run --access public",
     "publish:public": "npm publish --access public"
@@ -18,9 +23,13 @@
   },
   "files": [
     "bin",
-    "src",
+    "cli",
     "README.md"
   ],
+  "dependencies": {
+    "dotenv": "^16.4.7",
+    "openai": "^5.0.0"
+  },
   "engines": {
     "node": ">=18"
   },

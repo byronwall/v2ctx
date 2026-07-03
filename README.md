@@ -3,8 +3,9 @@
 Turn screen recordings and voice memos into a structured, **digestible**
 context package — a timestamped transcript, screenshots and a single-image
 **contact sheet** when video is present, and a self-contained **HTML report**
-tying it all together — using **local** FFmpeg and whisper.cpp. No API calls,
-no uploads.
+tying it all together — using **local** FFmpeg and Parakeet or whisper.cpp.
+Transcript analysis can optionally use the OpenAI API when you pass
+`--run-llm`.
 
 The resulting folder is the artifact you hand to a person or an LLM/agent when
 you want to understand or ask questions over a walkthrough, meeting, or spoken
@@ -16,10 +17,13 @@ agent can consume them directly.
 Prerequisites (Homebrew):
 
 ```bash
-brew install ffmpeg whisper-cpp
+brew install ffmpeg uv
+uv tool install parakeet-mlx -U
+# Optional, only when using --transcriber whisper:
+brew install whisper-cpp
 ```
 
-If either dependency is missing, the CLI will offer to install it for you with a
+If a local dependency is missing, the CLI will offer to install it for you with a
 `yes/no` prompt. Use `-y` or `--yes` to approve dependency installation without
 prompting.
 
@@ -44,8 +48,20 @@ For local development from this repo:
 npm install -g .      # or: npm link
 ```
 
-Whisper models are downloaded and cached automatically on first use under
-`~/.cache/video-to-context/models/`.
+The repository now keeps the Node CLI implementation in `cli/` and the local
+review UI in `app/`. Run the Solid/Vite review app during development with:
+
+```bash
+npm --prefix app install
+npm --prefix app run dev
+```
+
+The current UI is a static local package viewer: open a generated context
+package folder and it reads the package files in-browser.
+
+Parakeet is the default transcription backend. Whisper models are downloaded and
+cached automatically on first use under `~/.cache/video-to-context/models/` when
+you choose `--transcriber whisper`.
 
 ## Usage
 
@@ -79,13 +95,62 @@ It auto-detects the likely Voice Memos folder, writes to
 `report.html` when it finishes. You can still override pieces:
 
 ```bash
-npx v2ctx --voice-memos -m medium --no-open
+npx v2ctx --voice-memos --transcriber whisper -m medium --no-open
 npx v2ctx --voice-memos /path/to/Voice\ Memos -o ~/Documents/memos-context
 ```
 
 If macOS reports that likely Voice Memos folders exist but cannot be read,
 grant Full Disk Access to your terminal app in System Settings, then rerun the
 same command.
+
+For the ongoing voice-memo workflow, use:
+
+```bash
+npx v2ctx voice-memos
+```
+
+This scans Apple Voice Memos, writes one context package per memo under
+`~/.v2c-voice-memos`, skips packages that already have transcripts and
+analysis, and creates `analysis/segments.json` plus
+`analysis/session-digest.md` for new or previously unprocessed memos.
+This is the primary "just works" path for daily use. To run the new
+API-backed transcript processing, add an OpenAI API key to `.env` and pass
+`--run-llm`:
+
+```bash
+OPENAI_API_KEY=...
+npx v2ctx voice-memos --run-llm
+```
+
+The LLM path rewrites segment structure, extracts excerpt-backed findings, and
+writes `analysis/transcript-summary.json`, `analysis/segment-analysis.jsonl`,
+and the existing derived review artifacts. The older Codex packet flow remains
+available for repair/debugging through the advanced flags.
+
+The lower-level analysis commands remain available for repair, debugging, or
+one-off package work.
+
+The same voice-memo scan/transcribe/segment workflow is also available through
+`analyze --voice-memos`:
+
+```bash
+npx v2ctx analyze --voice-memos
+```
+
+Advanced package commands, useful while the model-backed stage is still being
+wired together:
+
+```bash
+npx v2ctx analyze ./demo-context
+npx v2ctx analyze ./demo-context --run-llm --derive
+npx v2ctx analyze ./demo-context --prepare-codex
+npx v2ctx analyze ./demo-context --import-codex --from ./results/segment-analysis.jsonl --derive
+```
+
+`--prepare-codex` also writes bounded prompt packets under
+`analysis/codex/` for the next model-backed segment analysis pass. By default,
+the CLI asks Codex to use `gpt-5.4-mini`, the mini-class model available in the
+ChatGPT Codex model picker. Override it with `--codex-model <model>`.
 
 Reruns are idempotent. Each output folder gets a `.v2c-manifest.json` recording
 the input files and meaningful options. If you run the same command again and
@@ -95,12 +160,27 @@ without extracting audio or transcribing again. Use `--force` to rebuild.
 | Option | Description |
 |---|---|
 | `-o, --output <dir>` | Output directory (default: `<name>-context`) |
-| `-m, --model <name>` | Whisper model: `tiny(.en)`, `base(.en)`, `small(.en)`, `medium(.en)`, `large-v3`, `large-v3-turbo`, or a path to a `ggml-*.bin` (default: `base.en`) |
+| `--transcriber <parakeet\|whisper>` | Audio-to-text backend (default: `parakeet`) |
+| `-m, --model <name>` | Whisper-only model: `tiny(.en)`, `base(.en)`, `small(.en)`, `medium(.en)`, `large-v3`, `large-v3-turbo`, or a path to a `ggml-*.bin` (default: `base.en`) |
+| `--decoding <mode>` | Parakeet decoding mode, e.g. `greedy` or `beam` |
+| `--beam-size <n>` | Parakeet beam size when using beam decoding |
 | `-l, --language <code>` | Spoken-language hint, e.g. `en` (default: auto-detect) |
 | `--interval <sec>` | Seconds between screenshots (default: `10`) |
 | `--scene [thresh]` | Scene-change detection instead of fixed interval (0..1, default `0.08`) |
 | `--contact <n>` | Frames in the contact sheet (default: `25`; `0` disables) |
 | `--voice-memos` | Auto-detect Apple Voice Memos, write to `~/.v2c-voice-memos`, skip visuals/source copies, open the report |
+| `--prepare-codex` | Advanced: with `analyze`, write `analysis/codex` prompt packets |
+| `--codex-model <model>` | Override the Codex model (default: `gpt-5.4-mini`) |
+| `--force-analysis` | With `analyze`, rebuild existing analysis files |
+| `--reset-analysis` | Delete generated `analysis/` assets before continuing |
+| `--import-codex` | Advanced: with `analyze`, validate and install Codex JSONL results into the package |
+| `--from <jsonl>` | Source JSONL path for `--import-codex` |
+| `--derive` | Advanced: with `analyze`, derive `tasks.jsonl`, `claims.jsonl`, `quotes.jsonl`, `blog-seeds.md`, and `review-inbox.jsonl` |
+| `--run-llm` | Run OpenAI-backed transcript sectioning, extraction, and synthesis |
+| `--llm-provider <provider>` | LLM provider for `--run-llm` (default: `openai`) |
+| `--llm-model <model>` | OpenAI model for `--run-llm` (default: `gpt-5.5`) |
+| `--run-codex` | With `analyze --prepare-codex`, run Codex on prepared packets |
+| `--no-codex` | With `voice-memos`, stop after preparing Codex packets |
 | `--open` | Open `report.html` when done |
 | `--no-open` | Don't open `report.html` when done |
 | `--no-source` | Don't copy source media into the package |
@@ -113,6 +193,18 @@ without extracting audio or transcribing again. Use `--force` to rebuild.
 ### Examples
 
 ```bash
+# Apple Voice Memos, process only new/unprocessed memos into per-memo packages
+npx v2ctx voice-memos
+
+# Same workflow, but don't run Codex/model analysis
+npx v2ctx voice-memos --no-codex
+
+# Reprocess audio/transcripts for all voice memos and rebuild analysis
+npx v2ctx voice-memos --force
+
+# Keep transcripts, but delete and rebuild all generated analysis assets
+npx v2ctx voice-memos --reset-analysis
+
 # Apple Voice Memos, one reusable local context package
 npx v2ctx --voice-memos
 
@@ -122,14 +214,36 @@ npx v2ctx
 # A single recording
 npx v2ctx demo.mov
 
-# Audio-only voice memos, higher-accuracy transcript
-npx v2ctx ~/Desktop/voice-memos -m medium --no-source
+# Audio-only voice memos, higher-accuracy whisper transcript
+npx v2ctx ~/Desktop/voice-memos --transcriber whisper -m medium --no-source
+
+# Audio-only voice memos, Parakeet beam decoding
+npx v2ctx ~/Desktop/voice-memos --decoding beam --beam-size 5 --no-source
 
 # Concatenate every media file on the Desktop, higher-accuracy transcript
-npx v2ctx ~/Desktop -m medium
+npx v2ctx ~/Desktop --transcriber whisper -m medium
 
 # Mostly-static UI: only capture meaningful screen changes
 npx v2ctx demo.mov --scene 0.05 -o ./demo-context
+```
+
+### Advanced analysis commands
+
+```bash
+# Same as voice-memos: process new/unprocessed memos, then analyze them
+npx v2ctx analyze --voice-memos
+
+# Prepare model packets for one package
+npx v2ctx analyze ~/.v2c-voice-memos/20260701-182553-469ECCA2-context --prepare-codex
+
+# Reset one package's analysis assets, then rebuild segment analysis scaffolding
+npx v2ctx analyze ~/.v2c-voice-memos/20260701-182553-469ECCA2-context --reset-analysis --prepare-codex
+
+# Prepare packets, run Codex, import output, and derive artifacts for one package
+npx v2ctx analyze ~/.v2c-voice-memos/20260701-182553-469ECCA2-context --prepare-codex --run-codex --derive
+
+# Import a Codex result and derive review artifacts
+npx v2ctx analyze ~/.v2c-voice-memos/20260701-182553-469ECCA2-context --import-codex --from ./results/segment-analysis.jsonl --derive
 ```
 
 ## Output structure
@@ -146,7 +260,18 @@ demo-context/
   transcript/
     transcript.txt         # plain text
     transcript.srt         # timestamped
+    transcript.vtt         # timestamped, when produced by the backend
     transcript.json        # structured, for scripting/search
+  analysis/
+    segments.json          # heuristic segment records with source lineage
+    segment-analysis.jsonl # validated Codex/model extraction records
+    tasks.jsonl            # derived action items
+    claims.jsonl           # derived claims/opinions/experience
+    quotes.jsonl           # derived quote candidates
+    blog-seeds.md          # derived blog seed notes
+    review-inbox.jsonl     # pending extracted items for human review
+    session-digest.md      # human-readable segment digest
+    codex/                 # optional prompt packets from analyze --prepare-codex
 ```
 
 ### Lineage (directory / multi-file mode)
@@ -160,5 +285,10 @@ with its source (e.g. `S2`).
 
 ## Model guidance
 
-Start with `base.en` (fast, small download). If product names or jargon come
-out wrong, rerun with `-m medium` or `-m large-v3-turbo`.
+Parakeet is the default and runs with explicit 120-second chunks and 15-second
+overlap. For accuracy-sensitive files, try `--decoding beam --beam-size 5`.
+
+When using `--transcriber whisper`, start with `base.en` (fast, small download).
+If product names or jargon come out wrong, rerun with a larger whisper model,
+such as `--transcriber whisper -m medium` or
+`--transcriber whisper -m large-v3-turbo`.
