@@ -83,6 +83,7 @@ function App() {
   const [processingPackageName, setProcessingPackageName] = createSignal("");
   const [freshPackageName, setFreshPackageName] = createSignal("");
   const [restoredInitialSnippet, setRestoredInitialSnippet] = createSignal(false);
+  const [restoredInitialSection, setRestoredInitialSection] = createSignal(false);
 
   onMount(() => {
     const handlePopState = () => {
@@ -90,9 +91,18 @@ function App() {
       setSelectedPackageName(selection.transcript ?? firstReadablePackage(packages())?.name ?? "");
       setSelectedOverlayId(selection.snippet ?? "");
       setRestoredInitialSnippet(false);
+      setRestoredInitialSection(false);
+      window.requestAnimationFrame(() => scrollToSectionHash("smooth"));
+    };
+    const handleHashChange = () => {
+      window.requestAnimationFrame(() => scrollToSectionHash("smooth"));
     };
     window.addEventListener("popstate", handlePopState);
-    onCleanup(() => window.removeEventListener("popstate", handlePopState));
+    window.addEventListener("hashchange", handleHashChange);
+    onCleanup(() => {
+      window.removeEventListener("popstate", handlePopState);
+      window.removeEventListener("hashchange", handleHashChange);
+    });
     void loadVoiceMemoLibrary();
   });
 
@@ -164,11 +174,20 @@ function App() {
 
   createEffect(() => {
     if (isLoading() || restoredInitialSnippet() || !initialUrlSelection.snippet) return;
+    if (currentSectionHashId()) return;
     const overlay = selectedOverlay();
     if (!overlay || overlay.id !== selectedOverlayId()) return;
     setRestoredInitialSnippet(true);
     window.requestAnimationFrame(() => {
       document.getElementById(lineDomId(overlay.startLine))?.scrollIntoView({ block: "center" });
+    });
+  });
+
+  createEffect(() => {
+    if (isLoading() || restoredInitialSection() || !currentSectionHashId()) return;
+    sections();
+    window.requestAnimationFrame(() => {
+      if (scrollToSectionHash("auto")) setRestoredInitialSection(true);
     });
   });
 
@@ -262,6 +281,15 @@ function App() {
   function selectOverlay(overlay: TranscriptOverlay) {
     setSelectedOverlayId(overlay.id);
     jumpTo(sourceStartMs(overlay.item) ?? transcriptLines()[overlay.startLine]?.startMs, overlay.startLine, false);
+  }
+
+  function linkToSection(section: TranscriptSection, event: MouseEvent) {
+    event.preventDefault();
+    const sectionId = sectionDomId(section.id);
+    const url = new URL(window.location.href);
+    url.hash = sectionId;
+    window.history.pushState(null, "", `${url.pathname}${url.search}${url.hash}`);
+    scrollToSectionHash("smooth");
   }
 
   return (
@@ -408,17 +436,25 @@ function App() {
             <div class="transcript-document">
               <For each={sections()}>
                 {(section) => (
-                  <article class="transcript-section" id={`section-${section.id}`}>
+                  <article class="transcript-section" id={sectionDomId(section.id)}>
                     <header>
-                      <button class="time-button" onClick={() => jumpTo(section.startMs, section.lines[0]?.index)}>
-                        {formatTime(section.startMs)}
-                      </button>
-                      <div>
-                        <h3>{section.title}</h3>
-                        <Show when={section.summary}>
-                          {(summary) => <p>{summary()}</p>}
-                        </Show>
-                      </div>
+                      <h3>
+                        <a
+                          class="section-title-link"
+                          href={`#${sectionDomId(section.id)}`}
+                          onClick={(event) => linkToSection(section, event)}
+                        >
+                          {section.title}
+                        </a>
+                      </h3>
+                      <Show when={section.summary}>
+                        {(summary) => (
+                          <div class="memo-summary section-summary">
+                            <strong>Section summary</strong>
+                            <p>{summary()}</p>
+                          </div>
+                        )}
+                      </Show>
                     </header>
                     <Show
                       when={section.lines.length}
@@ -971,6 +1007,32 @@ function replaceUrlSelection(transcript: string, snippet: string) {
 
 function lineDomId(index: number): string {
   return `transcript-line-${index}`;
+}
+
+function sectionDomId(id: string): string {
+  const normalized = id.trim().replace(/[^a-zA-Z0-9_-]+/g, "-").replace(/^-+|-+$/g, "");
+  return `section-${normalized || "transcript"}`;
+}
+
+function currentSectionHashId(): string {
+  if (typeof window === "undefined" || !window.location.hash) return "";
+  const hash = window.location.hash.slice(1);
+  let decodedHash = hash;
+  try {
+    decodedHash = decodeURIComponent(hash);
+  } catch {
+    decodedHash = hash;
+  }
+  return decodedHash.startsWith("section-") ? decodedHash : "";
+}
+
+function scrollToSectionHash(behavior: ScrollBehavior): boolean {
+  const id = currentSectionHashId();
+  if (!id) return false;
+  const target = document.getElementById(id);
+  if (!target) return false;
+  target.scrollIntoView({ block: "start", behavior });
+  return true;
 }
 
 function packageDate(name: string): number {
