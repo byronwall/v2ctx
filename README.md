@@ -56,8 +56,8 @@ npm --prefix app install
 npm --prefix app run dev
 ```
 
-The current UI is a static local package viewer: open a generated context
-package folder and it reads the package files in-browser.
+The current UI is a local transcript review workspace for generated context
+packages. See [Review UI](#review-ui) for the dedicated walkthrough.
 
 Parakeet is the default transcription backend. Whisper models are downloaded and
 cached automatically on first use under `~/.cache/video-to-context/models/` when
@@ -157,6 +157,54 @@ the input files and meaningful options. If you run the same command again and
 the files/options still match, the CLI prints the existing outputs and exits
 without extracting audio or transcribing again. Use `--force` to rebuild.
 
+## Review UI
+
+The Solid/Vite app in `app/` provides a local review workspace for transcript
+packages, with the voice memo library on the left, a sectioned transcript in the
+middle, and audio plus selected evidence on the right.
+
+![Review UI workspace](docs/readme-assets/review-ui-workspace.jpg)
+
+Run it during development with:
+
+```bash
+npm --prefix app install
+npm --prefix app run dev
+```
+
+By default the dev server reads generated voice-memo context packages from
+`~/.v2c-voice-memos` through local Vite API routes. You can also use
+**Open package** to load a package directory in-browser when you want to inspect
+one generated folder directly.
+
+The workspace is built for reviewing `--run-llm` and derived analysis output:
+
+- transcript cards show package status, audio duration, section count, and
+  overlay count
+- generated transcript summaries and section summaries sit above the raw lines
+- extracted tasks, ideas, quotes, blog seeds, and sensitive flags are highlighted
+  directly in the transcript
+- the right pane shows the selected overlay's type, match quality, timestamp,
+  source file, excerpt, related snippets, and a **Play from source** action
+- filter buttons narrow overlays to all items, tasks, ideas, quotes, blog seeds,
+  or sensitive flags
+- **Run LLM** can trigger local package analysis from the selected transcript
+  when the API key and local environment are configured
+
+The transcript header keeps the package title, line and overlay counts, summary,
+and generated main points visible before the raw transcript begins.
+
+![Transcript summary and main points](docs/readme-assets/review-ui-summary-main-points.jpg)
+
+![Selected overlay detail](docs/readme-assets/review-ui-overlay-detail.jpg)
+
+Selections are deep-linkable. The URL query parameters identify the transcript
+package and selected overlay, and the hash scrolls to a transcript section:
+
+```text
+?transcript=<package-name>&snippet=<package-name>::<review-item-id>#section-<segment-id>
+```
+
 | Option | Description |
 |---|---|
 | `-o, --output <dir>` | Output directory (default: `<name>-context`) |
@@ -178,7 +226,7 @@ without extracting audio or transcribing again. Use `--force` to rebuild.
 | `--derive` | Advanced: with `analyze`, derive `tasks.jsonl`, `claims.jsonl`, `quotes.jsonl`, `blog-seeds.md`, and `review-inbox.jsonl` |
 | `--run-llm` | Run OpenAI-backed transcript sectioning, extraction, and synthesis |
 | `--llm-provider <provider>` | LLM provider for `--run-llm` (default: `openai`) |
-| `--llm-model <model>` | OpenAI model for `--run-llm` (default: `gpt-5.5`) |
+| `--llm-model <model>` | OpenAI model for `--run-llm` (default: `gpt-5.4-mini`) |
 | `--run-codex` | With `analyze --prepare-codex`, run Codex on prepared packets |
 | `--no-codex` | With `voice-memos`, stop after preparing Codex packets |
 | `--open` | Open `report.html` when done |

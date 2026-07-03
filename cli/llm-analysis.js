@@ -11,7 +11,7 @@ const REPO_ROOT = path.resolve(MODULE_DIR, "..");
 
 export const LLM_PROMPT_VERSION = "transcript-llm-analysis@2026-07-03.1";
 export const DEFAULT_LLM_PROVIDER = "openai";
-export const DEFAULT_LLM_MODEL = "gpt-5.5";
+export const DEFAULT_LLM_MODEL = "gpt-5.4-mini";
 
 const ITEM_FIELDS = [
   "claims",
@@ -25,6 +25,38 @@ const ITEM_FIELDS = [
   "followUpQuestions",
   "sensitiveFlags",
 ];
+
+const PRICE_SOURCE = {
+  provider: "openai",
+  url: "https://developers.openai.com/api/docs/pricing",
+  retrievedAt: "2026-07-03",
+  unit: "usd_per_1m_tokens",
+};
+
+const OPENAI_STANDARD_PRICES = {
+  "gpt-5.5": {
+    shortContext: { input: 5, cachedInput: 0.5, output: 30 },
+    longContext: { input: 10, cachedInput: 1, output: 45 },
+  },
+  "gpt-5.5-pro": {
+    shortContext: { input: 30, cachedInput: null, output: 180 },
+    longContext: { input: 60, cachedInput: null, output: 270 },
+  },
+  "gpt-5.4": {
+    shortContext: { input: 2.5, cachedInput: 0.25, output: 15 },
+    longContext: { input: 5, cachedInput: 0.5, output: 22.5 },
+  },
+  "gpt-5.4-mini": {
+    shortContext: { input: 0.75, cachedInput: 0.075, output: 4.5 },
+  },
+  "gpt-5.4-nano": {
+    shortContext: { input: 0.2, cachedInput: 0.02, output: 1.25 },
+  },
+  "gpt-5.4-pro": {
+    shortContext: { input: 30, cachedInput: null, output: 180 },
+    longContext: { input: 60, cachedInput: null, output: 270 },
+  },
+};
 
 export async function runLlmAnalysis(packageDir, opts = {}) {
   const root = path.resolve(expandHome(packageDir));
@@ -56,12 +88,17 @@ export async function runLlmAnalysis(packageDir, opts = {}) {
     info("OpenAI client ready");
     const rewrittenSegments = [];
     const records = [];
+    const llmUsage = createUsageAccumulator(provider, model);
 
     for (const [index, segment] of segments.entries()) {
       const label = `${segment.id} (${index + 1}/${segments.length}, ${segment.start || fmtTime((segment.startMs || 0) / 1000)} - ${segment.end || fmtTime((segment.endMs || 0) / 1000)})`;
       info(`rewrite start: ${label}`);
-      const rewritten = await rewriteSegment(client, { model, segment });
-      info(`rewrite done: ${label} -> ${rewritten.title || segment.title || "(untitled)"}`);
+      const rewriteCall = await rewriteSegment(client, { model, segment });
+      const rewritten = rewriteCall.data;
+      addUsage(llmUsage, rewriteCall);
+      info(
+        `rewrite done: ${label} -> ${rewritten.title || segment.title || "(untitled)"} ${formatCallUsage(rewriteCall)}`,
+      );
       rewrittenSegments.push({
         ...segment,
         title: rewritten.title || segment.title,
@@ -72,22 +109,27 @@ export async function runLlmAnalysis(packageDir, opts = {}) {
       });
 
       info(`extract start: ${label}`);
-      const extraction = await extractSegment(client, { model, segment });
+      const extractionCall = await extractSegment(client, { model, segment });
+      const extraction = extractionCall.data;
+      addUsage(llmUsage, extractionCall);
       const record = normalizeExtractionRecord(segment, extraction);
       records.push(record);
-      info(`extract done: ${label} -> ${itemCount(record)} item(s)`);
+      info(`extract done: ${label} -> ${itemCount(record)} item(s) ${formatCallUsage(extractionCall)}`);
     }
 
     info(`synthesis start: ${records.length} segment record(s)`);
-    const summary = await synthesizeTranscript(client, {
+    const synthesisCall = await synthesizeTranscript(client, {
       model,
       root,
       segments: rewrittenSegments,
       records,
     });
+    const summary = synthesisCall.data;
+    addUsage(llmUsage, synthesisCall);
     info(
-      `synthesis done: ${summary.title || path.basename(root)}; ${(summary.topBullets || []).length} bullet(s), ${(summary.sections || []).length} section(s)`,
+      `synthesis done: ${summary.title || path.basename(root)}; ${(summary.topBullets || []).length} bullet(s), ${(summary.sections || []).length} section(s) ${formatCallUsage(synthesisCall)}`,
     );
+    info(`LLM total: ${formatUsageSummary(llmUsage.totals)} ${formatCost(llmUsage.totalCost)}`);
 
     const updatedSegmentsPayload = {
       ...segmentsPayload,
@@ -113,6 +155,7 @@ export async function runLlmAnalysis(packageDir, opts = {}) {
           model,
           provider,
           generatedAt: startedAt,
+          usage: usageSummaryForJson(llmUsage),
           title: normalizeTitle(summary.title, root),
           summary: summary.summary || "",
           topBullets: summary.topBullets || [],
@@ -133,6 +176,7 @@ export async function runLlmAnalysis(packageDir, opts = {}) {
       segmentAnalysisPath,
       transcriptSummaryPath,
       count: records.length,
+      usage: usageSummaryForJson(llmUsage),
     };
   } catch (err) {
     const message = err instanceof Error ? err.message : String(err);
@@ -207,6 +251,120 @@ function formatDuration(ms) {
   const seconds = Math.round(ms / 1000);
   if (seconds < 60) return `${seconds}s`;
   return `${Math.floor(seconds / 60)}m ${String(seconds % 60).padStart(2, "0")}s`;
+}
+
+function createUsageAccumulator(provider, model) {
+  const pricing = priceForModel(provider, model);
+  return {
+    provider,
+    model,
+    pricing,
+    calls: 0,
+    totalCost: pricing ? 0 : null,
+    totals: emptyUsage(),
+  };
+}
+
+function emptyUsage() {
+  return {
+    inputTokens: 0,
+    cachedInputTokens: 0,
+    outputTokens: 0,
+    totalTokens: 0,
+  };
+}
+
+function addUsage(accumulator, call) {
+  accumulator.calls += 1;
+  accumulator.totals.inputTokens += call.usage.inputTokens;
+  accumulator.totals.cachedInputTokens += call.usage.cachedInputTokens;
+  accumulator.totals.outputTokens += call.usage.outputTokens;
+  accumulator.totals.totalTokens += call.usage.totalTokens;
+  if (accumulator.totalCost !== null && call.cost !== null) {
+    accumulator.totalCost += call.cost;
+  }
+}
+
+function priceForModel(provider, model) {
+  if (provider !== "openai") return null;
+  const baseModel = String(model || "").replace(/-\d{4}-\d{2}-\d{2}$/, "");
+  const prices = OPENAI_STANDARD_PRICES[baseModel];
+  if (!prices) return null;
+  return {
+    model: baseModel,
+    context: "short",
+    ...prices.shortContext,
+    source: PRICE_SOURCE,
+  };
+}
+
+function normalizeUsage(usage) {
+  const inputTokens = numberOrZero(usage?.input_tokens);
+  const cachedInputTokens = numberOrZero(usage?.input_tokens_details?.cached_tokens);
+  const outputTokens = numberOrZero(usage?.output_tokens);
+  return {
+    inputTokens,
+    cachedInputTokens,
+    outputTokens,
+    totalTokens: numberOrZero(usage?.total_tokens) || inputTokens + outputTokens,
+  };
+}
+
+function numberOrZero(value) {
+  return Number.isFinite(value) ? value : 0;
+}
+
+function estimateCost(usage, pricing) {
+  if (!pricing) return null;
+  const cachedInputTokens = pricing.cachedInput === null ? 0 : usage.cachedInputTokens;
+  const uncachedInputTokens = Math.max(usage.inputTokens - cachedInputTokens, 0);
+  const cachedInputCost =
+    pricing.cachedInput === null ? 0 : (cachedInputTokens / 1_000_000) * pricing.cachedInput;
+  const inputCost = (uncachedInputTokens / 1_000_000) * pricing.input;
+  const outputCost = (usage.outputTokens / 1_000_000) * pricing.output;
+  return inputCost + cachedInputCost + outputCost;
+}
+
+function formatCallUsage(call) {
+  return `(${formatUsageSummary(call.usage)} ${formatCost(call.cost)})`;
+}
+
+function formatUsageSummary(usage) {
+  const cached = usage.cachedInputTokens ? `, cached=${formatCount(usage.cachedInputTokens)}` : "";
+  return `tokens in=${formatCount(usage.inputTokens)}${cached}, out=${formatCount(usage.outputTokens)}, total=${formatCount(usage.totalTokens)}`;
+}
+
+function formatCount(value) {
+  return Math.round(value).toLocaleString("en-US");
+}
+
+function formatCost(cost) {
+  if (cost === null) return "cost=unknown";
+  if (cost > 0 && cost < 0.01) return `cost=$${cost.toFixed(4)}`;
+  return `cost=$${cost.toFixed(2)}`;
+}
+
+function usageSummaryForJson(accumulator) {
+  return {
+    provider: accumulator.provider,
+    model: accumulator.model,
+    calls: accumulator.calls,
+    inputTokens: accumulator.totals.inputTokens,
+    cachedInputTokens: accumulator.totals.cachedInputTokens,
+    outputTokens: accumulator.totals.outputTokens,
+    totalTokens: accumulator.totals.totalTokens,
+    estimatedCostUsd: accumulator.totalCost,
+    pricing: accumulator.pricing
+      ? {
+          source: accumulator.pricing.source,
+          model: accumulator.pricing.model,
+          context: accumulator.pricing.context,
+          inputUsdPer1MTokens: accumulator.pricing.input,
+          cachedInputUsdPer1MTokens: accumulator.pricing.cachedInput,
+          outputUsdPer1MTokens: accumulator.pricing.output,
+        }
+      : null,
+  };
 }
 
 async function rewriteSegment(client, { model, segment }) {
@@ -288,7 +446,12 @@ async function callStructured(client, { model, name, schema, input }) {
   });
   const text = response.output_text || extractOutputText(response);
   if (!text) throw new Error(`OpenAI response for ${name} did not include output text.`);
-  return JSON.parse(text);
+  const usage = normalizeUsage(response.usage);
+  return {
+    data: JSON.parse(text),
+    usage,
+    cost: estimateCost(usage, priceForModel("openai", model)),
+  };
 }
 
 function extractOutputText(response) {

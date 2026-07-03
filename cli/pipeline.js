@@ -68,7 +68,7 @@ OPTIONS
       --derive           Advanced: derive tasks/claims/quotes/blog/review
       --run-llm          Run provider-backed transcript analysis
       --llm-provider <p> LLM provider (default: openai)
-      --llm-model <m>    LLM model (default: gpt-5.5)
+      --llm-model <m>    LLM model (default: gpt-5.4-mini)
       --run-codex        With analyze, run Codex on prepared packets
       --no-codex         In voice-memos, stop after preparing Codex packets
       --open             Open report.html when done
