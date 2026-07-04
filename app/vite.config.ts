@@ -36,7 +36,7 @@ function voiceMemosApi() {
             const requestStarted = Date.now();
             console.log("[v2ctx-ui] voice memo refresh requested");
             if (!voiceMemosRefreshPromise) {
-              voiceMemosRefreshPromise = run(["voice-memos", "--no-open", "--no-codex"]).finally(() => {
+              voiceMemosRefreshPromise = run(["voice-memos", "--no-open"]).finally(() => {
                 voiceMemosRefreshPromise = null;
               });
             } else {
@@ -233,9 +233,7 @@ function inferStatus(files) {
   const has = (suffix) => files.some((file) => file.path.endsWith(suffix));
   if (has("analysis/review-inbox.jsonl")) return "derived";
   if (has("analysis/segment-analysis.jsonl")) return "analysis_ready";
-  if (files.some((file) => file.path.includes("analysis/codex/results/"))) return "codex_ready_to_import";
   if (has("analysis/llm-error.json")) return "llm_failed";
-  if (has("analysis/codex/manifest.json")) return "waiting_for_codex";
   if (has("analysis/segments.json")) return "segments_ready";
   if (has("transcript/transcript.json") || has("transcript/transcript.txt")) return "transcribed";
   return "new";

@@ -52,7 +52,6 @@ export type Segment = {
   summary?: string;
   text?: string;
   cleanedText?: string;
-  sectionHints?: string[];
 };
 
 export type TranscriptItem = {
@@ -83,8 +82,6 @@ export type PackageStatus =
   | "new"
   | "transcribed"
   | "segments_ready"
-  | "waiting_for_codex"
-  | "codex_ready_to_import"
   | "llm_failed"
   | "analysis_ready"
   | "derived"

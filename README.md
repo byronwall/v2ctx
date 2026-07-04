@@ -122,10 +122,10 @@ OPENAI_API_KEY=...
 npx v2ctx voice-memos --run-llm
 ```
 
-The LLM path rewrites segment structure, extracts excerpt-backed findings, and
-writes `analysis/transcript-summary.json`, `analysis/segment-analysis.jsonl`,
-and the existing derived review artifacts. The older Codex packet flow remains
-available for repair/debugging through the advanced flags.
+The LLM path determines semantic sections from the full transcript, runs
+whole-transcript extraction passes by item type, and writes
+`analysis/transcript-summary.json`, `analysis/segment-analysis.jsonl`, and the
+existing derived review artifacts.
 
 The lower-level analysis commands remain available for repair, debugging, or
 one-off package work.
@@ -143,14 +143,7 @@ wired together:
 ```bash
 npx v2ctx analyze ./demo-context
 npx v2ctx analyze ./demo-context --run-llm --derive
-npx v2ctx analyze ./demo-context --prepare-codex
-npx v2ctx analyze ./demo-context --import-codex --from ./results/segment-analysis.jsonl --derive
 ```
-
-`--prepare-codex` also writes bounded prompt packets under
-`analysis/codex/` for the next model-backed segment analysis pass. By default,
-the CLI asks Codex to use `gpt-5.4-mini`, the mini-class model available in the
-ChatGPT Codex model picker. Override it with `--codex-model <model>`.
 
 Reruns are idempotent. Each output folder gets a `.v2c-manifest.json` recording
 the input files and meaningful options. If you run the same command again and
@@ -217,18 +210,12 @@ package and selected overlay, and the hash scrolls to a transcript section:
 | `--scene [thresh]` | Scene-change detection instead of fixed interval (0..1, default `0.08`) |
 | `--contact <n>` | Frames in the contact sheet (default: `25`; `0` disables) |
 | `--voice-memos` | Auto-detect Apple Voice Memos, write to `~/.v2c-voice-memos`, skip visuals/source copies, open the report |
-| `--prepare-codex` | Advanced: with `analyze`, write `analysis/codex` prompt packets |
-| `--codex-model <model>` | Override the Codex model (default: `gpt-5.4-mini`) |
 | `--force-analysis` | With `analyze`, rebuild existing analysis files |
 | `--reset-analysis` | Delete generated `analysis/` assets before continuing |
-| `--import-codex` | Advanced: with `analyze`, validate and install Codex JSONL results into the package |
-| `--from <jsonl>` | Source JSONL path for `--import-codex` |
 | `--derive` | Advanced: with `analyze`, derive `tasks.jsonl`, `claims.jsonl`, `quotes.jsonl`, `blog-seeds.md`, and `review-inbox.jsonl` |
 | `--run-llm` | Run OpenAI-backed transcript sectioning, extraction, and synthesis |
 | `--llm-provider <provider>` | LLM provider for `--run-llm` (default: `openai`) |
 | `--llm-model <model>` | OpenAI model for `--run-llm` (default: `gpt-5.4-mini`) |
-| `--run-codex` | With `analyze --prepare-codex`, run Codex on prepared packets |
-| `--no-codex` | With `voice-memos`, stop after preparing Codex packets |
 | `--open` | Open `report.html` when done |
 | `--no-open` | Don't open `report.html` when done |
 | `--no-source` | Don't copy source media into the package |
@@ -243,9 +230,6 @@ package and selected overlay, and the hash scrolls to a transcript section:
 ```bash
 # Apple Voice Memos, process only new/unprocessed memos into per-memo packages
 npx v2ctx voice-memos
-
-# Same workflow, but don't run Codex/model analysis
-npx v2ctx voice-memos --no-codex
 
 # Reprocess audio/transcripts for all voice memos and rebuild analysis
 npx v2ctx voice-memos --force
@@ -281,17 +265,11 @@ npx v2ctx demo.mov --scene 0.05 -o ./demo-context
 # Same as voice-memos: process new/unprocessed memos, then analyze them
 npx v2ctx analyze --voice-memos
 
-# Prepare model packets for one package
-npx v2ctx analyze ~/.v2c-voice-memos/20260701-182553-469ECCA2-context --prepare-codex
+# Run full-transcript LLM sectioning and extraction for one package
+npx v2ctx analyze ~/.v2c-voice-memos/20260701-182553-469ECCA2-context --run-llm --derive
 
-# Reset one package's analysis assets, then rebuild segment analysis scaffolding
-npx v2ctx analyze ~/.v2c-voice-memos/20260701-182553-469ECCA2-context --reset-analysis --prepare-codex
-
-# Prepare packets, run Codex, import output, and derive artifacts for one package
-npx v2ctx analyze ~/.v2c-voice-memos/20260701-182553-469ECCA2-context --prepare-codex --run-codex --derive
-
-# Import a Codex result and derive review artifacts
-npx v2ctx analyze ~/.v2c-voice-memos/20260701-182553-469ECCA2-context --import-codex --from ./results/segment-analysis.jsonl --derive
+# Reset one package's analysis assets, then rerun full-transcript LLM analysis
+npx v2ctx analyze ~/.v2c-voice-memos/20260701-182553-469ECCA2-context --reset-analysis --run-llm --derive
 ```
 
 ## Output structure
@@ -311,15 +289,14 @@ demo-context/
     transcript.vtt         # timestamped, when produced by the backend
     transcript.json        # structured, for scripting/search
   analysis/
-    segments.json          # heuristic segment records with source lineage
-    segment-analysis.jsonl # validated Codex/model extraction records
+    segments.json          # source scaffold, then LLM semantic section records
+    segment-analysis.jsonl # validated whole-transcript extraction records
     tasks.jsonl            # derived action items
     claims.jsonl           # derived claims/opinions/experience
     quotes.jsonl           # derived quote candidates
     blog-seeds.md          # derived blog seed notes
     review-inbox.jsonl     # pending extracted items for human review
     session-digest.md      # human-readable segment digest
-    codex/                 # optional prompt packets from analyze --prepare-codex
 ```
 
 ### Lineage (directory / multi-file mode)

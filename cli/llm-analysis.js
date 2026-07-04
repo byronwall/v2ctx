@@ -71,64 +71,44 @@ export async function runLlmAnalysis(packageDir, opts = {}) {
   }
 
   const segmentsPayload = await readJson(segmentsPath);
-  const segments = segmentsPayload?.segments || [];
-  if (!segments.length) {
-    throw new Error(`No segments found for LLM analysis: ${segmentsPath}`);
-  }
+  const sourceSegments = segmentsPayload?.segments || [];
+  if (!sourceSegments.length) throw new Error(`No transcript scaffold found for LLM analysis: ${segmentsPath}`);
+  const transcript = await readTranscriptContext(root, sourceSegments);
 
   const startedAt = new Date(parseInt(process.env.V2C_NOW || Date.now(), 10)).toISOString();
   const startedMs = Date.now();
   step(`LLM transcript analysis: ${path.basename(root)}`);
-  info(`provider=${provider} model=${model} segments=${segments.length}`);
+  info(`provider=${provider} model=${model} transcriptItems=${transcript.items.length}`);
   info(`package=${root}`);
   try {
     await fs.rm(errorPath, { force: true });
     info("loading OpenAI client and .env");
     const client = opts.openAIClient || createOpenAIClient(root);
     info("OpenAI client ready");
-    const rewrittenSegments = [];
-    const records = [];
     const llmUsage = createUsageAccumulator(provider, model);
 
-    for (const [index, segment] of segments.entries()) {
-      const label = `${segment.id} (${index + 1}/${segments.length}, ${segment.start || fmtTime((segment.startMs || 0) / 1000)} - ${segment.end || fmtTime((segment.endMs || 0) / 1000)})`;
-      info(`rewrite start: ${label}`);
-      const rewriteCall = await rewriteSegment(client, { model, segment });
-      const rewritten = rewriteCall.data;
-      addUsage(llmUsage, rewriteCall);
-      info(
-        `rewrite done: ${label} -> ${rewritten.title || segment.title || "(untitled)"} ${formatCallUsage(rewriteCall)}`,
-      );
-      rewrittenSegments.push({
-        ...segment,
-        title: rewritten.title || segment.title,
-        gist: rewritten.gist || segment.gist,
-        summary: rewritten.summary || segment.summary,
-        cleanedText: rewritten.cleanedText || segment.text,
-        sectionHints: rewritten.sectionHints || [],
+    info("semantic sectioning start");
+    const planCall = await planTranscript(client, { model, root, transcript });
+    const summary = planCall.data;
+    addUsage(llmUsage, planCall);
+    const semanticSegments = normalizePlannedSegments(summary.sections || [], transcript, sourceSegments);
+    info(`semantic sectioning done: ${semanticSegments.length} section(s) ${formatCallUsage(planCall)}`);
+
+    const record = emptyTranscriptRecord(transcript, sourceSegments);
+    for (const field of ITEM_FIELDS) {
+      info(`extract ${field} start`);
+      const extractionCall = await extractTranscriptItems(client, {
+        model,
+        field,
+        transcript,
+        segments: semanticSegments,
       });
-
-      info(`extract start: ${label}`);
-      const extractionCall = await extractSegment(client, { model, segment });
-      const extraction = extractionCall.data;
       addUsage(llmUsage, extractionCall);
-      const record = normalizeExtractionRecord(segment, extraction);
-      records.push(record);
-      info(`extract done: ${label} -> ${itemCount(record)} item(s) ${formatCallUsage(extractionCall)}`);
+      record[field] = normalizeItems(extractionCall.data.items || [], transcript, semanticSegments);
+      info(`extract ${field} done: ${record[field].length} item(s) ${formatCallUsage(extractionCall)}`);
     }
-
-    info(`synthesis start: ${records.length} segment record(s)`);
-    const synthesisCall = await synthesizeTranscript(client, {
-      model,
-      root,
-      segments: rewrittenSegments,
-      records,
-    });
-    const summary = synthesisCall.data;
-    addUsage(llmUsage, synthesisCall);
-    info(
-      `synthesis done: ${summary.title || path.basename(root)}; ${(summary.topBullets || []).length} bullet(s), ${(summary.sections || []).length} section(s) ${formatCallUsage(synthesisCall)}`,
-    );
+    validateExtractionRecord(record);
+    const records = [record];
     info(`LLM total: ${formatUsageSummary(llmUsage.totals)} ${formatCost(llmUsage.totalCost)}`);
 
     const updatedSegmentsPayload = {
@@ -136,7 +116,11 @@ export async function runLlmAnalysis(packageDir, opts = {}) {
       promptVersion: LLM_PROMPT_VERSION,
       llmModel: model,
       generatedAt: startedAt,
-      segments: rewrittenSegments,
+      segmentation: {
+        method: "llm_full_transcript",
+        sourceBoundaryAssumption: "Each source audio file is a meaningful input boundary before LLM semantic sectioning.",
+      },
+      segments: semanticSegments,
     };
     info(`writing ${path.relative(root, segmentsPath)}`);
     await fs.writeFile(segmentsPath, `${JSON.stringify(updatedSegmentsPayload, null, 2)}\n`, "utf8");
@@ -160,7 +144,7 @@ export async function runLlmAnalysis(packageDir, opts = {}) {
           summary: summary.summary || "",
           topBullets: summary.topBullets || [],
           themes: summary.themes || [],
-          sections: normalizeSummarySections(summary.sections || [], rewrittenSegments),
+          sections: normalizeSummarySections(semanticSegments),
         },
         null,
         2,
@@ -261,6 +245,7 @@ function createUsageAccumulator(provider, model) {
     pricing,
     calls: 0,
     totalCost: pricing ? 0 : null,
+    costBreakdown: pricing ? emptyCostBreakdown() : null,
     totals: emptyUsage(),
   };
 }
@@ -282,6 +267,11 @@ function addUsage(accumulator, call) {
   accumulator.totals.totalTokens += call.usage.totalTokens;
   if (accumulator.totalCost !== null && call.cost !== null) {
     accumulator.totalCost += call.cost;
+  }
+  if (accumulator.costBreakdown && call.costBreakdown) {
+    accumulator.costBreakdown.uncachedInputCost += call.costBreakdown.uncachedInputCost;
+    accumulator.costBreakdown.cachedInputCost += call.costBreakdown.cachedInputCost;
+    accumulator.costBreakdown.outputCost += call.costBreakdown.outputCost;
   }
 }
 
@@ -315,23 +305,50 @@ function numberOrZero(value) {
 }
 
 function estimateCost(usage, pricing) {
+  return estimateCostBreakdown(usage, pricing)?.totalCost ?? null;
+}
+
+function estimateCostBreakdown(usage, pricing) {
   if (!pricing) return null;
   const cachedInputTokens = pricing.cachedInput === null ? 0 : usage.cachedInputTokens;
   const uncachedInputTokens = Math.max(usage.inputTokens - cachedInputTokens, 0);
   const cachedInputCost =
     pricing.cachedInput === null ? 0 : (cachedInputTokens / 1_000_000) * pricing.cachedInput;
-  const inputCost = (uncachedInputTokens / 1_000_000) * pricing.input;
+  const uncachedInputCost = (uncachedInputTokens / 1_000_000) * pricing.input;
   const outputCost = (usage.outputTokens / 1_000_000) * pricing.output;
-  return inputCost + cachedInputCost + outputCost;
+  return {
+    uncachedInputTokens,
+    cachedInputTokens,
+    uncachedInputCost,
+    cachedInputCost,
+    outputCost,
+    totalCost: uncachedInputCost + cachedInputCost + outputCost,
+  };
+}
+
+function emptyCostBreakdown() {
+  return {
+    uncachedInputCost: 0,
+    cachedInputCost: 0,
+    outputCost: 0,
+  };
 }
 
 function formatCallUsage(call) {
-  return `(${formatUsageSummary(call.usage)} ${formatCost(call.cost)})`;
+  return `(${formatUsageSummary(call.usage)} ${formatCostBreakdown(call.costBreakdown, call.cost)})`;
 }
 
 function formatUsageSummary(usage) {
-  const cached = usage.cachedInputTokens ? `, cached=${formatCount(usage.cachedInputTokens)}` : "";
-  return `tokens in=${formatCount(usage.inputTokens)}${cached}, out=${formatCount(usage.outputTokens)}, total=${formatCount(usage.totalTokens)}`;
+  const cachedInputTokens = usage.cachedInputTokens || 0;
+  const uncachedInputTokens = Math.max((usage.inputTokens || 0) - cachedInputTokens, 0);
+  const cacheRate = usage.inputTokens ? cachedInputTokens / usage.inputTokens : 0;
+  return [
+    `tokens in=${formatCount(usage.inputTokens)}`,
+    `cached=${formatCount(cachedInputTokens)} (${formatPercent(cacheRate)})`,
+    `uncached=${formatCount(uncachedInputTokens)}`,
+    `out=${formatCount(usage.outputTokens)}`,
+    `total=${formatCount(usage.totalTokens)}`,
+  ].join(", ");
 }
 
 function formatCount(value) {
@@ -344,16 +361,49 @@ function formatCost(cost) {
   return `cost=$${cost.toFixed(2)}`;
 }
 
+function formatCostBreakdown(breakdown, totalCost) {
+  if (!breakdown) return formatCost(totalCost);
+  return [
+    formatCost(totalCost),
+    `uncached_in=${formatCostValue(breakdown.uncachedInputCost)}`,
+    `cached_in=${formatCostValue(breakdown.cachedInputCost)}`,
+    `out=${formatCostValue(breakdown.outputCost)}`,
+  ].join(", ");
+}
+
+function formatCostValue(cost) {
+  if (cost === null || cost === undefined) return "unknown";
+  if (cost > 0 && cost < 0.01) return `$${cost.toFixed(4)}`;
+  return `$${cost.toFixed(2)}`;
+}
+
+function formatPercent(value) {
+  return `${Math.round(value * 100)}%`;
+}
+
 function usageSummaryForJson(accumulator) {
+  const cachedInputTokens = accumulator.totals.cachedInputTokens;
+  const uncachedInputTokens = Math.max(accumulator.totals.inputTokens - cachedInputTokens, 0);
   return {
     provider: accumulator.provider,
     model: accumulator.model,
     calls: accumulator.calls,
     inputTokens: accumulator.totals.inputTokens,
     cachedInputTokens: accumulator.totals.cachedInputTokens,
+    uncachedInputTokens,
+    cachedInputRatio: accumulator.totals.inputTokens
+      ? cachedInputTokens / accumulator.totals.inputTokens
+      : 0,
     outputTokens: accumulator.totals.outputTokens,
     totalTokens: accumulator.totals.totalTokens,
     estimatedCostUsd: accumulator.totalCost,
+    estimatedCostBreakdownUsd: accumulator.costBreakdown
+      ? {
+          uncachedInput: accumulator.costBreakdown.uncachedInputCost,
+          cachedInput: accumulator.costBreakdown.cachedInputCost,
+          output: accumulator.costBreakdown.outputCost,
+        }
+      : null,
     pricing: accumulator.pricing
       ? {
           source: accumulator.pricing.source,
@@ -367,66 +417,43 @@ function usageSummaryForJson(accumulator) {
   };
 }
 
-async function rewriteSegment(client, { model, segment }) {
+async function planTranscript(client, { model, root, transcript }) {
   return callStructured(client, {
     model,
-    name: "segment_rewrite",
-    schema: segmentRewriteSchema(),
+    name: "transcript_plan",
+    schema: transcriptPlanSchema(),
     input: [
-      "Clean and structure this voice memo transcript segment.",
-      "Keep the meaning grounded in the source text. Remove filler and false starts only when they do not carry meaning.",
-      "Return concise section metadata and readable cleaned text.",
+      transcriptPrefix(transcript),
       "",
-      segmentInput(segment),
-    ].join("\n"),
-  });
-}
-
-async function extractSegment(client, { model, segment }) {
-  return callStructured(client, {
-    model,
-    name: "segment_extraction",
-    schema: segmentExtractionSchema(),
-    input: [
-      "Extract grounded findings from this voice memo transcript segment.",
-      "Every non-empty item must include a short excerpt copied from the source transcript.",
-      "Do not invent tasks, claims, projects, examples, or certainty that is not supported by the transcript.",
-      "Use empty arrays when nothing grounded exists for a field.",
-      "",
-      segmentInput(segment),
-    ].join("\n"),
-  });
-}
-
-async function synthesizeTranscript(client, { model, root, segments, records }) {
-  const compact = segments.map((segment) => ({
-    id: segment.id,
-    start: segment.start,
-    end: segment.end,
-    title: segment.title,
-    summary: segment.summary,
-    cleanedText: segment.cleanedText,
-    itemCounts: Object.fromEntries(
-      ITEM_FIELDS.map((field) => [
-        field,
-        records.find((record) => record.segmentId === segment.id)?.[field]?.length || 0,
-      ]),
-    ),
-  }));
-
-  return callStructured(client, {
-    model,
-    name: "transcript_synthesis",
-    schema: transcriptSynthesisSchema(),
-    input: [
-      "Create the top-level summary structure for this voice memo package.",
-      "Use only the supplied compact segment summaries and extraction counts.",
-      "Generate a concise human-readable title for the whole note. Prefer 4-9 words. Use title case only when it reads naturally.",
-      "The title should describe the memo's main subject, not the source file, package path, date, or generic phrase like voice memo.",
-      "The UI will use sections to organize the raw timestamped transcript, so section titles should be specific and scannable.",
+      "Task: determine the semantic sections for this entire voice memo transcript.",
+      "Use the full context to choose boundaries by meaning, not by fixed pauses or cue phrases.",
+      "Respect source audio files as meaningful outer boundaries: do not create a section that crosses source files unless the transcript itself clearly spans a continued thought across combined files.",
+      "Return a concise package title, summary, top bullets, themes, and ordered sections.",
+      "Each section must include start and end timestamps that exist within the transcript range, a specific title, a short summary, and cleanedText for that section.",
       "",
       `Package: ${root}`,
-      JSON.stringify(compact, null, 2),
+    ].join("\n"),
+  });
+}
+
+async function extractTranscriptItems(client, { model, field, transcript, segments }) {
+  return callStructured(client, {
+    model,
+    name: `extract_${field}`,
+    schema: transcriptExtractionSchema(),
+    input: [
+      transcriptPrefix(transcript),
+      "",
+      "Semantic sections:",
+      JSON.stringify(segments.map(({ id, title, start, end }) => ({ id, title, start, end })), null, 2),
+      "",
+      `Task: extract ${field} from the entire transcript.`,
+      extractionGuidance(field),
+      "Every item must be grounded in transcript text.",
+      "Each item must include a short primary excerpt copied from the transcript.",
+      "Use supportingQuotes when the same idea is repeated or strengthened by multiple transcript passages.",
+      "Do not invent facts, examples, tasks, opinions, project names, or certainty.",
+      "Leave items empty when the transcript does not contain grounded entries for this type.",
     ].join("\n"),
   });
 }
@@ -451,6 +478,7 @@ async function callStructured(client, { model, name, schema, input }) {
     data: JSON.parse(text),
     usage,
     cost: estimateCost(usage, priceForModel("openai", model)),
+    costBreakdown: estimateCostBreakdown(usage, priceForModel("openai", model)),
   };
 }
 
@@ -464,37 +492,40 @@ function extractOutputText(response) {
   return chunks.join("");
 }
 
-function normalizeExtractionRecord(segment, extraction) {
+function emptyTranscriptRecord(transcript, sourceSegments) {
   const record = {
-    segmentId: segment.id,
+    segmentId: "transcript",
     promptVersion: LLM_PROMPT_VERSION,
-    start: segment.start,
-    end: segment.end,
-    sourceFiles: segment.sourceFiles || [],
-    claims: normalizeItems(extraction.claims, segment),
-    opinions: normalizeItems(extraction.opinions, segment),
-    experience: normalizeItems(extraction.experience, segment),
-    tasks: normalizeItems(extraction.tasks, segment),
-    blogSeeds: normalizeItems(extraction.blogSeeds, segment),
-    tweetCandidates: normalizeItems(extraction.tweetCandidates, segment),
-    quoteCandidates: normalizeItems(extraction.quoteCandidates, segment),
-    voiceMarkers: normalizeItems(extraction.voiceMarkers, segment),
-    followUpQuestions: normalizeItems(extraction.followUpQuestions, segment),
-    sensitiveFlags: normalizeItems(extraction.sensitiveFlags, segment),
+    start: transcript.start,
+    end: transcript.end,
+    sourceFiles: [...new Set(sourceSegments.flatMap((segment) => segment.sourceFiles || []))],
   };
-  validateExtractionRecord(record);
+  for (const field of ITEM_FIELDS) record[field] = [];
   return record;
 }
 
-function normalizeItems(items, segment) {
+function normalizeItems(items, transcript, segments) {
   return (items || [])
     .filter((item) => item?.text)
-    .map((item) => ({
-      text: item.text.trim(),
-      excerpt: String(item.excerpt || "").trim(),
-      uncertainty: !!item.uncertainty,
-      evidence: evidenceQuality(segment.text || "", item.excerpt || ""),
-    }));
+    .map((item) => {
+      const excerpt = String(item.excerpt || "").trim();
+      const supportingQuotes = (item.supportingQuotes || [])
+        .filter((quote) => quote?.excerpt)
+        .map((quote) => ({
+          excerpt: String(quote.excerpt || "").trim(),
+          note: String(quote.note || "").trim(),
+          evidence: evidenceQuality(transcript.text, quote.excerpt || ""),
+          sourceSegments: sourceSegmentsForExcerpt(segments, quote.excerpt || ""),
+        }));
+      return {
+        text: item.text.trim(),
+        excerpt,
+        uncertainty: !!item.uncertainty,
+        evidence: evidenceQuality(transcript.text, excerpt),
+        supportingQuotes,
+        sourceSegments: sourceSegmentsForExcerpt(segments, excerpt),
+      };
+    });
 }
 
 function validateExtractionRecord(record) {
@@ -522,24 +553,39 @@ function evidenceQuality(source, excerpt) {
   return matched / excerptWords.length >= 0.65 ? "fuzzy" : "unmatched";
 }
 
-function normalizeSummarySections(sections, segments) {
-  const byId = new Map(segments.map((segment) => [segment.id, segment]));
-  return sections.map((section, index) => {
-    const sourceSegmentIds = (section.sourceSegmentIds || []).filter((id) => byId.has(id));
-    const sourceSegments = sourceSegmentIds.map((id) => byId.get(id));
-    const first = sourceSegments[0] || segments[index] || segments[0];
-    const last = sourceSegments.at(-1) || first;
-    return {
-      title: section.title || first?.title || `Section ${index + 1}`,
-      summary: section.summary || first?.summary || "",
-      start: section.start || first?.start || fmtTime(0),
-      end: section.end || last?.end || fmtTime(0),
-      startMs: first?.startMs ?? 0,
-      endMs: last?.endMs ?? first?.endMs ?? 0,
-      cleanedText: section.cleanedText || sourceSegments.map((segment) => segment.cleanedText || segment.text).join("\n\n"),
-      sourceSegmentIds: sourceSegmentIds.length ? sourceSegmentIds : first ? [first.id] : [],
-    };
-  });
+function sourceSegmentsForExcerpt(segments, excerpt) {
+  if (!excerpt.trim()) return [];
+  const exact = segments.filter((segment) => normalizeSearch(segment.text || "").includes(normalizeSearch(excerpt)));
+  if (exact.length) return exact.map(sourceSegmentRef);
+  return segments
+    .map((segment) => ({
+      segment,
+      quality: evidenceQuality(segment.text || "", excerpt),
+    }))
+    .filter((match) => match.quality === "fuzzy")
+    .map((match) => sourceSegmentRef(match.segment));
+}
+
+function sourceSegmentRef(segment) {
+  return {
+    segmentId: segment.id,
+    title: segment.title,
+    start: segment.start,
+    end: segment.end,
+  };
+}
+
+function normalizeSummarySections(segments) {
+  return segments.map((segment) => ({
+    title: segment.title,
+    summary: segment.summary,
+    start: segment.start,
+    end: segment.end,
+    startMs: segment.startMs,
+    endMs: segment.endMs,
+    cleanedText: segment.cleanedText || segment.text,
+    sourceSegmentIds: [segment.id],
+  }));
 }
 
 function normalizeTitle(title, root) {
@@ -548,59 +594,7 @@ function normalizeTitle(title, root) {
   return cleaned.slice(0, 120);
 }
 
-function segmentInput(segment) {
-  return [
-    `Segment ID: ${segment.id}`,
-    `Start: ${segment.start}`,
-    `End: ${segment.end}`,
-    `Source files: ${(segment.sourceFiles || []).join(", ") || "(unknown)"}`,
-    "",
-    "Transcript:",
-    segment.text || "",
-  ].join("\n");
-}
-
-function segmentRewriteSchema() {
-  return {
-    type: "object",
-    additionalProperties: false,
-    required: ["title", "gist", "summary", "cleanedText", "sectionHints"],
-    properties: {
-      title: { type: "string" },
-      gist: { type: "string" },
-      summary: { type: "string" },
-      cleanedText: { type: "string" },
-      sectionHints: {
-        type: "array",
-        items: { type: "string" },
-      },
-    },
-  };
-}
-
-function segmentExtractionSchema() {
-  const itemArray = {
-    type: "array",
-    items: {
-      type: "object",
-      additionalProperties: false,
-      required: ["text", "excerpt", "uncertainty"],
-      properties: {
-        text: { type: "string" },
-        excerpt: { type: "string" },
-        uncertainty: { type: "boolean" },
-      },
-    },
-  };
-  return {
-    type: "object",
-    additionalProperties: false,
-    required: ITEM_FIELDS,
-    properties: Object.fromEntries(ITEM_FIELDS.map((field) => [field, itemArray])),
-  };
-}
-
-function transcriptSynthesisSchema() {
+function transcriptPlanSchema() {
   return {
     type: "object",
     additionalProperties: false,
@@ -628,6 +622,222 @@ function transcriptSynthesisSchema() {
       },
     },
   };
+}
+
+function transcriptExtractionSchema() {
+  return {
+    type: "object",
+    additionalProperties: false,
+    required: ["items"],
+    properties: {
+      items: {
+        type: "array",
+        items: {
+          type: "object",
+          additionalProperties: false,
+          required: ["text", "excerpt", "uncertainty", "supportingQuotes"],
+          properties: {
+            text: { type: "string" },
+            excerpt: { type: "string" },
+            uncertainty: { type: "boolean" },
+            supportingQuotes: {
+              type: "array",
+              items: {
+                type: "object",
+                additionalProperties: false,
+                required: ["excerpt", "note"],
+                properties: {
+                  excerpt: { type: "string" },
+                  note: { type: "string" },
+                },
+              },
+            },
+          },
+        },
+      },
+    },
+  };
+}
+
+async function readTranscriptContext(root, sourceSegments) {
+  const transcriptPath = path.join(root, "transcript", "transcript.json");
+  const transcriptJson = await readJson(transcriptPath);
+  const rawItems = transcriptItems(transcriptJson);
+  const items = rawItems.length
+    ? rawItems.map((item, index) => normalizeTranscriptItem(item, index)).filter((item) => item.text)
+    : sourceSegments.map((segment, index) => ({
+        index,
+        startMs: segment.startMs || 0,
+        endMs: segment.endMs || segment.startMs || 0,
+        start: segment.start || fmtTime((segment.startMs || 0) / 1000),
+        end: segment.end || fmtTime((segment.endMs || segment.startMs || 0) / 1000),
+        sourceFile: segment.sourceFiles?.[0] || "",
+        text: segment.text || "",
+      }));
+  if (!items.length) throw new Error(`No transcript items found under ${root}`);
+  const text = items.map((item) => item.text).join(" ").replace(/\s+/g, " ").trim();
+  return {
+    source: rawItems.length ? "transcript/transcript.json" : "analysis/segments.json",
+    start: fmtTime((items[0]?.startMs || 0) / 1000),
+    end: fmtTime((items.at(-1)?.endMs || items.at(-1)?.startMs || 0) / 1000),
+    text,
+    items,
+    body: items
+      .map((item) => `[${item.start} - ${item.end}]${item.sourceFile ? ` (${item.sourceFile})` : ""} ${item.text}`)
+      .join("\n"),
+  };
+}
+
+function transcriptItems(payload) {
+  if (!payload) return [];
+  if (Array.isArray(payload)) return payload;
+  return (
+    payload.items ||
+    payload.transcription ||
+    payload.sentences ||
+    payload.segments ||
+    payload.chunks ||
+    payload.results ||
+    []
+  );
+}
+
+function normalizeTranscriptItem(item, index) {
+  const startMs = transcriptTimeMs(
+    item.startMs ??
+      item.offsets?.from ??
+      item.start_ms ??
+      item.start ??
+      item.start_time ??
+      item.timestamp?.[0] ??
+      item.timestamps?.from ??
+      0,
+    item.startMs != null || item.offsets?.from != null || item.start_ms != null,
+  );
+  const endMs = transcriptTimeMs(
+    item.endMs ??
+      item.offsets?.to ??
+      item.end_ms ??
+      item.end ??
+      item.end_time ??
+      item.timestamp?.[1] ??
+      item.timestamps?.to ??
+      startMs,
+    item.endMs != null || item.offsets?.to != null || item.end_ms != null,
+  );
+  return {
+    index,
+    startMs,
+    endMs: Math.max(endMs, startMs),
+    start: fmtTime(startMs / 1000),
+    end: fmtTime(Math.max(endMs, startMs) / 1000),
+    sourceFile: item.sourceFile || item.source || "",
+    text: String(item.text || item.transcript || item.sentence || "").trim(),
+  };
+}
+
+function transcriptTimeMs(value, alreadyMs) {
+  if (typeof value === "number") return alreadyMs ? value : value * 1000;
+  if (typeof value === "string" && value.includes(":")) return parseClock(value) ?? 0;
+  const parsed = parseFloat(value);
+  if (!Number.isFinite(parsed)) return 0;
+  return alreadyMs ? parsed : parsed * 1000;
+}
+
+function normalizePlannedSegments(sections, transcript, sourceSegments) {
+  const fallback = sourceSegments.map((segment, index) => plannedSegmentFromSource(segment, index));
+  const planned = sections.length ? sections : fallback;
+  return planned.map((section, index) => {
+    const startMs = clampMs(parseClock(section.start) ?? fallback[index]?.startMs ?? 0, transcript);
+    const endMs = clampMs(parseClock(section.end) ?? fallback[index]?.endMs ?? startMs, transcript);
+    const text = textForRange(transcript.items, startMs, Math.max(endMs, startMs));
+    const id = `seg_${String(index + 1).padStart(3, "0")}`;
+    return {
+      id,
+      startMs,
+      endMs: Math.max(endMs, startMs),
+      start: fmtTime(startMs / 1000),
+      end: fmtTime(Math.max(endMs, startMs) / 1000),
+      title: String(section.title || `Section ${index + 1}`).trim(),
+      gist: String(section.summary || "").slice(0, 240),
+      summary: String(section.summary || "").trim(),
+      sourceFiles: sourceFilesForRange(sourceSegments, startMs, Math.max(endMs, startMs)),
+      boundary: {
+        kind: "llm_semantic",
+        reason: "Boundary chosen by the LLM from the full transcript context.",
+      },
+      text,
+      cleanedText: String(section.cleanedText || text).trim(),
+    };
+  });
+}
+
+function plannedSegmentFromSource(segment, index) {
+  return {
+    title: segment.title || `Section ${index + 1}`,
+    summary: segment.summary || segment.gist || "",
+    startMs: segment.startMs || 0,
+    endMs: segment.endMs || segment.startMs || 0,
+    start: segment.start,
+    end: segment.end,
+    cleanedText: segment.text || "",
+  };
+}
+
+function clampMs(ms, transcript) {
+  const first = transcript.items[0]?.startMs ?? 0;
+  const last = transcript.items.at(-1)?.endMs ?? transcript.items.at(-1)?.startMs ?? first;
+  return Math.max(first, Math.min(ms, last));
+}
+
+function textForRange(items, startMs, endMs) {
+  return items
+    .filter((item) => item.endMs >= startMs && item.startMs <= endMs)
+    .map((item) => item.text)
+    .join(" ")
+    .replace(/\s+/g, " ")
+    .trim();
+}
+
+function sourceFilesForRange(sourceSegments, startMs, endMs) {
+  const files = sourceSegments
+    .filter((segment) => (segment.endMs ?? segment.startMs ?? 0) >= startMs && (segment.startMs ?? 0) <= endMs)
+    .flatMap((segment) => segment.sourceFiles || []);
+  return [...new Set(files)];
+}
+
+function transcriptPrefix(transcript) {
+  return [
+    "Full timestamped transcript:",
+    `Source: ${transcript.source}`,
+    `Range: ${transcript.start} - ${transcript.end}`,
+    "",
+    transcript.body,
+  ].join("\n");
+}
+
+function extractionGuidance(field) {
+  const guidance = {
+    claims: "Extract factual or quasi-factual assertions the speaker makes about the world, systems, products, or project state.",
+    opinions: "Extract preferences, judgments, evaluations, tradeoffs, and subjective conclusions.",
+    experience: "Extract first-person experience, observed workflow, prior use, or remembered project history.",
+    tasks: "Extract concrete actions, implementation ideas, decisions to make, or follow-up work.",
+    blogSeeds: "Extract ideas that could become durable essays, posts, or project notes.",
+    tweetCandidates: "Extract concise standalone observations that could work as short public notes.",
+    quoteCandidates: "Extract memorable phrases worth preserving close to the speaker's wording.",
+    voiceMarkers: "Extract patterns in speaking style, uncertainty, recurring framing, or transcript-quality caveats.",
+    followUpQuestions: "Extract questions that should be answered to clarify or advance the work.",
+    sensitiveFlags: "Extract privacy, security, credential, workplace, personal, or policy-sensitive concerns.",
+  };
+  return guidance[field] || `Extract ${field}.`;
+}
+
+function parseClock(value) {
+  if (!value || typeof value !== "string") return undefined;
+  const parts = value.replace(",", ".").split(":");
+  if (parts.length !== 3) return undefined;
+  const [hours, minutes, seconds] = parts;
+  return Number(hours) * 3_600_000 + Number(minutes) * 60_000 + Number(seconds) * 1000;
 }
 
 async function readJson(file) {

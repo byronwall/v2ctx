@@ -15,7 +15,6 @@ import {
   DEFAULT_LLM_PROVIDER,
   defaultVoiceMemoOutput,
   getPackageStatus,
-  importCodexResults,
   resetAnalysisAssets,
 } from "./analysis.js";
 
@@ -59,18 +58,12 @@ OPTIONS
       --voice-memos      Auto-detect Apple Voice Memos, write to
                          ~/.v2c-voice-memos, skip visuals/source copies, open
                          report.html when done
-      --prepare-codex    Advanced: write analysis/codex prompt packets
-      --codex-model <m>  Override Codex model (default: gpt-5.4-mini)
       --force-analysis   With analyze, rebuild existing analysis files
       --reset-analysis   Delete analysis assets before continuing
-      --import-codex     Advanced: validate and install Codex JSONL results
-      --from <jsonl>     With --import-codex, source JSONL to import
       --derive           Advanced: derive tasks/claims/quotes/blog/review
       --run-llm          Run provider-backed transcript analysis
       --llm-provider <p> LLM provider (default: openai)
       --llm-model <m>    LLM model (default: gpt-5.4-mini)
-      --run-codex        With analyze, run Codex on prepared packets
-      --no-codex         In voice-memos, stop after preparing Codex packets
       --open             Open report.html when done
       --no-open          Don't open report.html
       --no-source        Don't copy source media into the package
@@ -90,11 +83,7 @@ EXAMPLES
   video-to-context voice-memos --transcriber whisper -m medium
   video-to-context voice-memos --force  # reprocess audio + transcript
   video-to-context voice-memos --reset-analysis
-  video-to-context voice-memos --no-codex # prepare packets, don't run model
   video-to-context analyze ./demo-context --run-llm --derive
-  video-to-context analyze ./demo-context --prepare-codex --run-codex --derive
-  video-to-context analyze ./demo-context --import-codex --from ./results/segment-analysis.jsonl --derive
-  video-to-context analyze ./demo-context --prepare-codex
   video-to-context --voice-memos         # Apple Voice Memos → ~/.v2c-voice-memos
   video-to-context                       # all media files in the current folder
   video-to-context demo.mov
@@ -123,9 +112,6 @@ function parseArgs(argv) {
     recursive: false,
     force: false,
     yes: false,
-    codexModel: null,
-    from: null,
-    runCodex: null,
     resetAnalysis: false,
     runLlm: false,
     llmProvider: DEFAULT_LLM_PROVIDER,
@@ -169,23 +155,11 @@ function parseArgs(argv) {
       case "--voice-memos":
         opts.voiceMemos = true;
         break;
-      case "--prepare-codex":
-        opts.prepareCodex = true;
-        break;
-      case "--codex-model":
-        opts.codexModel = next();
-        break;
       case "--force-analysis":
         opts.forceAnalysis = true;
         break;
       case "--reset-analysis":
         opts.resetAnalysis = true;
-        break;
-      case "--import-codex":
-        opts.importCodex = true;
-        break;
-      case "--from":
-        opts.from = next();
         break;
       case "--derive":
         opts.derive = true;
@@ -198,12 +172,6 @@ function parseArgs(argv) {
         break;
       case "--llm-model":
         opts.llmModel = next();
-        break;
-      case "--run-codex":
-        opts.runCodex = true;
-        break;
-      case "--no-codex":
-        opts.runCodex = false;
         break;
       case "--open":
         opts.openReport = true;
@@ -281,7 +249,7 @@ async function runAnalyze(argv) {
     return;
   }
   if (!opts.input) {
-    throw new Error("Usage: v2c analyze <context-package> [--prepare-codex]");
+    throw new Error("Usage: v2c analyze <context-package> [--run-llm --derive]");
   }
 
   if (opts.resetAnalysis) {
@@ -291,29 +259,13 @@ async function runAnalyze(argv) {
     opts.forceAnalysis = true;
   }
 
-  if (opts.importCodex) {
-    step(`Importing Codex results for ${opts.input}`);
-    const imported = await importCodexResults(opts.input, opts);
-    done(`${imported.count} record(s) validated and installed`);
-    log(`  codex_result   ${imported.codexResultPath}`);
-    log(`  analysis       ${imported.analysisPath}`);
-  }
-
   step(`Analyzing ${opts.input}`);
   const result = await analyzePackage(opts.input, opts);
   done(result.skipped ? "already analyzed" : `${result.count} segment(s)`);
   log(`\n\x1b[1mAnalysis files:\x1b[0m`);
   log(`  segments       ${result.segmentsPath}`);
   log(`  digest         ${result.digestPath}`);
-  if (opts.prepareCodex) log(`  codex_packets  ${result.codexDir}`);
   log("");
-
-  if (opts.runCodex === true && opts.prepareCodex) {
-    step(`Continuing Codex analysis for ${opts.input}`);
-    const continued = await continueAnalysisPackage(opts.input, opts);
-    done(`${continued.actions.join(", ") || "already complete"}`);
-    return;
-  }
 
   if (opts.runLlm) {
     step(`Running LLM transcript analysis for ${opts.input}`);
@@ -908,14 +860,8 @@ function describeNextAction(packageDir, status) {
   switch (status.nextAction) {
     case "run_llm":
       return `v2c analyze ${packageDir} --run-llm --derive`;
-    case "run_codex":
-      return `v2c analyze ${packageDir} --prepare-codex --run-codex --derive`;
-    case "import_codex":
-      return `v2c analyze ${packageDir} --import-codex --derive`;
     case "derive":
       return `v2c analyze ${packageDir} --derive`;
-    case "prepare_codex":
-      return `v2c analyze ${packageDir} --prepare-codex`;
     case "segment":
       return `v2c analyze ${packageDir}`;
     case "transcribe":

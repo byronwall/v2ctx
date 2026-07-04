@@ -897,8 +897,6 @@ const packageProcessRanks: Record<PackageStatus, number> = {
   new: 2,
   transcribed: 3,
   segments_ready: 4,
-  waiting_for_codex: 5,
-  codex_ready_to_import: 6,
   analysis_ready: 7,
   derived: 8,
 };

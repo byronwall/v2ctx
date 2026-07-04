@@ -1,17 +1,10 @@
 import fs from "node:fs/promises";
 import path from "node:path";
 import os from "node:os";
-import { exec, fmtTime, info, step, done, warn } from "./util.js";
+import { fmtTime, info, step, done, warn } from "./util.js";
 import { DEFAULT_LLM_MODEL, DEFAULT_LLM_PROVIDER, runLlmAnalysis } from "./llm-analysis.js";
 
-const PROMPT_VERSION = "segment-analysis@2026-07-01";
 const SEGMENT_SCHEMA_VERSION = 1;
-const PAUSE_BREAK_MS = 45_000;
-const MAX_SEGMENT_MS = 18 * 60 * 1000;
-const MIN_SEGMENT_MS = 2 * 60 * 1000;
-const DEFAULT_CODEX_MODEL = "gpt-5.4-mini";
-const CUE_RE =
-  /\b(next up|okay|quick interruption|continuing|moving on|separate thing|new topic|another thing|switching gears|back to|where was i)\b/i;
 
 const DERIVED_FILES = [
   "tasks.jsonl",
@@ -34,9 +27,8 @@ export async function analyzePackage(packageDir, opts = {}) {
   const analysisDir = path.join(root, "analysis");
   const segmentsPath = path.join(analysisDir, "segments.json");
   const digestPath = path.join(analysisDir, "session-digest.md");
-  const codexDir = path.join(analysisDir, "codex");
   const exists = await pathExists(segmentsPath);
-  if (exists && !opts.forceAnalysis && !opts.prepareCodex) {
+  if (exists && !opts.forceAnalysis) {
     info(`analysis already exists: ${segmentsPath}`);
     return { root, skipped: true, segmentsPath, digestPath };
   }
@@ -59,21 +51,11 @@ export async function analyzePackage(packageDir, opts = {}) {
     "utf8",
   );
 
-  if (opts.prepareCodex) {
-    await prepareCodexPackets({
-      codexDir,
-      root,
-      segments,
-      preferredModel: opts.codexModel || DEFAULT_CODEX_MODEL,
-    });
-  }
-
   return {
     root,
     skipped: false,
     segmentsPath,
     digestPath,
-    codexDir,
     count: segments.length,
   };
 }
@@ -83,41 +65,6 @@ export async function resetAnalysisAssets(packageDir) {
   const analysisDir = path.join(root, "analysis");
   await fs.rm(analysisDir, { recursive: true, force: true });
   return { root, analysisDir };
-}
-
-export async function importCodexResults(packageDir, opts = {}) {
-  const root = path.resolve(expandHome(packageDir));
-  const analysisDir = path.join(root, "analysis");
-  const codexDir = path.join(analysisDir, "codex");
-  const manifestPath = path.join(codexDir, "manifest.json");
-  const manifest = await readJson(manifestPath);
-  if (!manifest) throw new Error(`Missing Codex manifest: ${manifestPath}`);
-
-  const source = path.resolve(
-    expandHome(opts.from) ||
-      path.join(codexDir, manifest.outputPath || "results/segment-analysis.jsonl"),
-  );
-  const records = await readJsonl(source);
-  validateSegmentAnalysis(records, manifest);
-
-  const codexResultPath = path.join(
-    codexDir,
-    manifest.outputPath || "results/segment-analysis.jsonl",
-  );
-  const analysisPath = path.join(analysisDir, "segment-analysis.jsonl");
-  await fs.mkdir(path.dirname(codexResultPath), { recursive: true });
-  await fs.mkdir(analysisDir, { recursive: true });
-  const body = records.map((record) => JSON.stringify(record)).join("\n") + "\n";
-  await fs.writeFile(codexResultPath, body, "utf8");
-  await fs.writeFile(analysisPath, body, "utf8");
-
-  return {
-    root,
-    source,
-    codexResultPath,
-    analysisPath,
-    count: records.length,
-  };
 }
 
 export async function deriveArtifacts(packageDir) {
@@ -181,18 +128,11 @@ export async function deriveArtifacts(packageDir) {
 export async function getPackageStatus(packageDir) {
   const root = path.resolve(expandHome(packageDir));
   const analysisDir = path.join(root, "analysis");
-  const codexDir = path.join(analysisDir, "codex");
-  const manifest = await readJson(path.join(codexDir, "manifest.json"));
-  const codexResultPath = manifest
-    ? path.join(codexDir, manifest.outputPath || "results/segment-analysis.jsonl")
-    : path.join(codexDir, "results", "segment-analysis.jsonl");
 
   const files = {
     transcriptJson: path.join(root, "transcript", "transcript.json"),
     transcriptTxt: path.join(root, "transcript", "transcript.txt"),
     segments: path.join(analysisDir, "segments.json"),
-    codexManifest: path.join(codexDir, "manifest.json"),
-    codexResult: codexResultPath,
     segmentAnalysis: path.join(analysisDir, "segment-analysis.jsonl"),
     reviewInbox: path.join(analysisDir, "review-inbox.jsonl"),
     transcriptSummary: path.join(analysisDir, "transcript-summary.json"),
@@ -216,17 +156,9 @@ export async function getPackageStatus(packageDir) {
     stage = "segments_ready";
     nextAction = "run_llm";
   }
-  if (exists.codexManifest) {
-    stage = "waiting_for_codex";
-    nextAction = "run_codex";
-  }
   if (exists.llmError && !exists.segmentAnalysis) {
     stage = "llm_failed";
     nextAction = "run_llm";
-  }
-  if (exists.codexResult && !exists.segmentAnalysis) {
-    stage = "codex_ready_to_import";
-    nextAction = "import_codex";
   }
   if (exists.segmentAnalysis) {
     stage = derivedComplete ? "derived" : "analysis_ready";
@@ -244,16 +176,8 @@ export async function continueAnalysisPackage(packageDir, opts = {}) {
   let status = await getPackageStatus(root);
   if (!status.exists.segments || opts.forceAnalysis) {
     actions.push("segment");
-    await analyzePackage(root, { ...opts, prepareCodex: false });
+    await analyzePackage(root, opts);
     status = await getPackageStatus(root);
-  }
-
-  if (!status.exists.codexManifest || opts.forceAnalysis || opts.prepareCodex) {
-    if (opts.prepareCodex || (!opts.runLlm && opts.runCodex !== false)) {
-      actions.push("prepare_codex");
-      await analyzePackage(root, { ...opts, prepareCodex: true, forceAnalysis: true });
-      status = await getPackageStatus(root);
-    }
   }
 
   if (!status.exists.segmentAnalysis) {
@@ -261,17 +185,6 @@ export async function continueAnalysisPackage(packageDir, opts = {}) {
       actions.push("run_llm");
       await runLlmAnalysis(root, opts);
       ranLlm = true;
-      status = await getPackageStatus(root);
-    } else if (status.exists.codexResult) {
-      actions.push("import_codex");
-      await importCodexResults(root, opts);
-      status = await getPackageStatus(root);
-    } else if (opts.runCodex !== false) {
-      actions.push("run_codex");
-      await runCodexAnalysis(root, opts);
-      status = await getPackageStatus(root);
-      actions.push("import_codex");
-      await importCodexResults(root, opts);
       status = await getPackageStatus(root);
     }
   } else if (opts.runLlm && !status.exists.transcriptSummary) {
@@ -292,62 +205,6 @@ export async function continueAnalysisPackage(packageDir, opts = {}) {
 
 export { DEFAULT_LLM_MODEL, DEFAULT_LLM_PROVIDER, runLlmAnalysis };
 
-export async function runCodexAnalysis(packageDir, opts = {}) {
-  const root = path.resolve(expandHome(packageDir));
-  const codexDir = path.join(root, "analysis", "codex");
-  const manifestPath = path.join(codexDir, "manifest.json");
-  const manifest = await readJson(manifestPath);
-  if (!manifest) throw new Error(`Missing Codex manifest: ${manifestPath}`);
-
-  const model = opts.codexModel || DEFAULT_CODEX_MODEL;
-  if (
-    manifest.preferredModel &&
-    manifest.preferredModel !== model &&
-    manifest.preferredModel !== "codex-default"
-  ) {
-    warn(
-      `Ignoring stale Codex manifest model ${manifest.preferredModel}; using ${model}.`,
-    );
-  }
-  const prompt = [
-    `Read manifest.json and instructions.md in: ${codexDir}`,
-    "",
-    "Process every segment packet listed in the manifest.",
-    "Write JSONL to the manifest outputPath exactly.",
-    "Follow expected-output-schema.json exactly.",
-    "Do not invent unsupported facts.",
-    "Do not edit repository files or any files outside this context package.",
-  ].join("\n");
-  const args = [
-    "exec",
-    "--skip-git-repo-check",
-    "-C",
-    codexDir,
-    "--add-dir",
-    root,
-    "-s",
-    "workspace-write",
-  ];
-  if (model) args.push("-m", model);
-  args.push(prompt);
-
-  try {
-    await exec("codex", args, { quiet: false });
-  } catch (err) {
-    throw new Error(
-      `Codex model analysis failed. Retry this package with: v2c analyze ${root} --prepare-codex --run-codex --derive\n${err.message}`,
-    );
-  }
-  const resultPath = path.join(
-    codexDir,
-    manifest.outputPath || "results/segment-analysis.jsonl",
-  );
-  if (!(await pathExists(resultPath))) {
-    throw new Error(`Codex finished but did not write expected result: ${resultPath}`);
-  }
-  return { root, resultPath };
-}
-
 export async function analyzeVoiceMemoPackages(opts = {}) {
   const root = path.resolve(expandHome(opts.output || defaultVoiceMemoOutput()));
   const packages = await findContextPackages(root);
@@ -361,7 +218,7 @@ export async function analyzeVoiceMemoPackages(opts = {}) {
     const hasAnalysis = await pathExists(
       path.join(packageDir, "analysis", "segments.json"),
     );
-    if (hasAnalysis && !opts.forceAnalysis && !opts.prepareCodex) continue;
+    if (hasAnalysis && !opts.forceAnalysis) continue;
     step(`Analyzing ${path.basename(packageDir)}`);
     const result = await analyzePackage(packageDir, opts);
     done(`${result.count || "existing"} segment(s)`);
@@ -371,76 +228,26 @@ export async function analyzeVoiceMemoPackages(opts = {}) {
   return results;
 }
 
-function validateSegmentAnalysis(records, manifest) {
-  const expected = new Set((manifest.packets || []).map((packet) => packet.segmentId));
-  const seen = new Set();
-  const required = [
-    "segmentId",
-    "promptVersion",
-    "start",
-    "end",
-    "sourceFiles",
-    "claims",
-    "opinions",
-    "experience",
-    "tasks",
-    "blogSeeds",
-    "tweetCandidates",
-    "quoteCandidates",
-    "voiceMarkers",
-    "followUpQuestions",
-    "sensitiveFlags",
-  ];
-  const arrayFields = required.slice(5);
-  const errors = [];
-
-  records.forEach((record, index) => {
-    const line = index + 1;
-    for (const field of required) {
-      if (!(field in record)) errors.push(`line ${line}: missing ${field}`);
-    }
-    if (!expected.has(record.segmentId)) {
-      errors.push(`line ${line}: unknown segmentId ${record.segmentId}`);
-    }
-    if (seen.has(record.segmentId)) {
-      errors.push(`line ${line}: duplicate segmentId ${record.segmentId}`);
-    }
-    seen.add(record.segmentId);
-    if (record.promptVersion !== manifest.promptVersion) {
-      errors.push(`line ${line}: expected promptVersion ${manifest.promptVersion}`);
-    }
-    if (!Array.isArray(record.sourceFiles)) {
-      errors.push(`line ${line}: sourceFiles must be an array`);
-    }
-    for (const field of arrayFields) {
-      if (!Array.isArray(record[field])) errors.push(`line ${line}: ${field} must be an array`);
-    }
-  });
-
-  for (const id of expected) {
-    if (!seen.has(id)) errors.push(`missing segmentId ${id}`);
-  }
-  if (errors.length) {
-    throw new Error(`Codex result validation failed:\n${errors.join("\n")}`);
-  }
-}
-
 function collectItems(records, field, type) {
   const items = [];
   for (const record of records) {
     for (const [index, item] of (record[field] || []).entries()) {
       const text = typeof item === "string" ? item : item.text;
       if (!text) continue;
+      const primarySource = item?.sourceSegments?.[0];
       items.push({
         id: `${type}_${record.segmentId}_${String(index + 1).padStart(2, "0")}`,
         type,
         text,
         excerpt: typeof item === "string" ? "" : item.excerpt || "",
         uncertainty: typeof item === "string" ? false : !!item.uncertainty,
+        evidence: typeof item === "string" ? "missing" : item.evidence || "missing",
+        supportingQuotes: typeof item === "string" ? [] : item.supportingQuotes || [],
+        sourceSegments: typeof item === "string" ? [] : item.sourceSegments || [],
         source: {
-          segmentId: record.segmentId,
-          start: record.start,
-          end: record.end,
+          segmentId: primarySource?.segmentId || record.segmentId,
+          start: primarySource?.start || record.start,
+          end: primarySource?.end || record.end,
           sourceFiles: record.sourceFiles || [],
         },
       });
@@ -554,35 +361,13 @@ function transcriptTimeMs(value, alreadyMs) {
 }
 
 function buildSegments(items, sources) {
-  const segments = [];
-  let current = [];
-
-  for (const item of items) {
-    if (current.length && shouldBreak(current, item, sources)) {
-      segments.push(finalizeSegment(current, segments.length, sources));
-      current = [];
-    }
-    current.push(item);
-  }
-  if (current.length) {
-    segments.push(finalizeSegment(current, segments.length, sources));
-  }
-  return segments;
-}
-
-function shouldBreak(current, next, sources) {
-  const first = current[0];
-  const prev = current[current.length - 1];
-  const elapsed = next.startMs - first.startMs;
-  const pause = next.startMs - prev.endMs;
-  const prevSource = sourceForMs(sources, prev.startMs)?.name;
-  const nextSource = sourceForMs(sources, next.startMs)?.name;
-
-  if (prevSource && nextSource && prevSource !== nextSource) return true;
-  if (pause >= PAUSE_BREAK_MS) return true;
-  if (elapsed >= MIN_SEGMENT_MS && CUE_RE.test(next.text)) return true;
-  if (elapsed >= MAX_SEGMENT_MS) return true;
-  return false;
+  if (!sources.length) return [finalizeSegment(items, 0, sources)];
+  return sources
+    .map((source, index) => {
+      const sourceItems = items.filter((item) => sourceForMs(sources, item.startMs)?.name === source.name);
+      return sourceItems.length ? finalizeSegment(sourceItems, index, sources) : null;
+    })
+    .filter(Boolean);
 }
 
 function finalizeSegment(items, index, sources) {
@@ -610,6 +395,13 @@ function finalizeSegment(items, index, sources) {
     gist: gistFromText(text),
     summary: summarizeText(text),
     sourceFiles,
+    boundary: {
+      kind: sourceFiles.length === 1 ? "source_file" : "transcript",
+      reason:
+        sourceFiles.length === 1
+          ? "One source audio file is treated as a meaningful initial boundary."
+          : "No source-file metadata was available, so the transcript is kept as one initial unit.",
+    },
     text,
   };
 }
@@ -700,116 +492,6 @@ function renderDigest({ root, segments, manifest, transcript }) {
     lines.push("");
   }
   return lines.join("\n");
-}
-
-async function prepareCodexPackets({ codexDir, root, segments, preferredModel }) {
-  const packetsDir = path.join(codexDir, "segment-packets");
-  const resultsDir = path.join(codexDir, "results");
-  await fs.mkdir(packetsDir, { recursive: true });
-  await fs.mkdir(resultsDir, { recursive: true });
-
-  const packetFiles = [];
-  for (const segment of segments) {
-    const file = `${segment.id}.md`;
-    await fs.writeFile(path.join(packetsDir, file), renderPacket(segment), "utf8");
-    packetFiles.push({ segmentId: segment.id, file: `segment-packets/${file}` });
-  }
-
-  await fs.writeFile(
-    path.join(codexDir, "manifest.json"),
-    `${JSON.stringify(
-      {
-        schemaVersion: 1,
-        promptVersion: PROMPT_VERSION,
-        preferredModel,
-        sourcePackage: root,
-        outputPath: "results/segment-analysis.jsonl",
-        packets: packetFiles,
-      },
-      null,
-      2,
-    )}\n`,
-    "utf8",
-  );
-  await fs.writeFile(
-    path.join(codexDir, "instructions.md"),
-    renderCodexInstructions(),
-    "utf8",
-  );
-  await fs.writeFile(
-    path.join(codexDir, "expected-output-schema.json"),
-    `${JSON.stringify(expectedOutputSchema(), null, 2)}\n`,
-    "utf8",
-  );
-}
-
-function renderPacket(segment) {
-  return `# Segment ${segment.id}
-
-Start: ${segment.start}
-End: ${segment.end}
-Source files: ${segment.sourceFiles.join(", ") || "(unknown)"}
-Prompt version: ${PROMPT_VERSION}
-
-## Task
-
-Return one JSON object for this segment with segmentId, promptVersion, start, end, sourceFiles, claims, opinions, experience, tasks, blog seeds, tweet candidates, quote candidates, voice markers, follow-up questions, and sensitive flags.
-
-## Transcript
-
-${segment.text}
-`;
-}
-
-function renderCodexInstructions() {
-  return `# Segment Analysis Instructions
-
-Use the Codex CLI's configured default model unless the command explicitly selected a model. Read every packet listed in \`manifest.json\` and write JSONL to \`results/segment-analysis.jsonl\`.
-
-Each line must be one JSON object matching \`expected-output-schema.json\`. Preserve \`segmentId\`, \`start\`, \`end\`, \`sourceFiles\`, and \`promptVersion\`. Do not invent facts, examples, tasks, opinions, project names, or conclusions that are not supported by the segment transcript. Mark uncertainty explicitly instead of filling gaps.
-
-Every extracted item should include a short source excerpt from the segment text. Leave arrays empty when no grounded item exists.
-`;
-}
-
-function expectedOutputSchema() {
-  return {
-    type: "object",
-    required: [
-      "segmentId",
-      "promptVersion",
-      "start",
-      "end",
-      "sourceFiles",
-      "claims",
-      "opinions",
-      "experience",
-      "tasks",
-      "blogSeeds",
-      "tweetCandidates",
-      "quoteCandidates",
-      "voiceMarkers",
-      "followUpQuestions",
-      "sensitiveFlags",
-    ],
-    properties: {
-      segmentId: { type: "string" },
-      promptVersion: { const: PROMPT_VERSION },
-      start: { type: "string" },
-      end: { type: "string" },
-      sourceFiles: { type: "array", items: { type: "string" } },
-      claims: { type: "array" },
-      opinions: { type: "array" },
-      experience: { type: "array" },
-      tasks: { type: "array" },
-      blogSeeds: { type: "array" },
-      tweetCandidates: { type: "array" },
-      quoteCandidates: { type: "array" },
-      voiceMarkers: { type: "array" },
-      followUpQuestions: { type: "array" },
-      sensitiveFlags: { type: "array" },
-    },
-  };
 }
 
 async function walk(dir, onDir) {
