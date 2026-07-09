@@ -12,6 +12,23 @@ you want to understand or ask questions over a walkthrough, meeting, or spoken
 note. On completion the CLI prints a flat list of every produced file so an
 agent can consume them directly.
 
+## Voice memo workspace
+
+The local voice memo site turns generated context packages into a reviewable
+workspace. The main review view keeps memo sections, transcript highlights, and
+the selected piece of evidence visible together.
+
+![Voice memo review workspace](docs/readme-assets/voice-memo-review.jpg)
+
+The other top-level views organize the same library into projects, extracted
+items, suggested discussion topics, and the complete memo catalog.
+
+| Projects | Extracted items |
+|---|---|
+| ![Voice memo projects view](docs/readme-assets/voice-memo-projects.jpg) | ![Voice memo extracted items view](docs/readme-assets/voice-memo-items.jpg) |
+| Topics to discuss next | All voice memos |
+| ![Voice memo topics view](docs/readme-assets/voice-memo-topics.jpg) | ![All voice memos view](docs/readme-assets/voice-memo-all-memos.jpg) |
+
 ## Install
 
 Prerequisites (Homebrew):
@@ -57,7 +74,7 @@ npm --prefix app run dev
 ```
 
 The current UI is a local transcript review workspace for generated context
-packages. See [Review UI](#review-ui) for the dedicated walkthrough.
+packages. See [Running the review UI](#running-the-review-ui) for the dedicated walkthrough.
 
 Parakeet is the default transcription backend. Whisper models are downloaded and
 cached automatically on first use under `~/.cache/video-to-context/models/` when
@@ -150,13 +167,11 @@ the input files and meaningful options. If you run the same command again and
 the files/options still match, the CLI prints the existing outputs and exits
 without extracting audio or transcribing again. Use `--force` to rebuild.
 
-## Review UI
+## Running the review UI
 
 The Solid/Vite app in `app/` provides a local review workspace for transcript
 packages, with the voice memo library on the left, a sectioned transcript in the
 middle, and audio plus selected evidence on the right.
-
-![Review UI workspace](docs/readme-assets/review-ui-workspace.jpg)
 
 Run it during development with:
 
@@ -186,10 +201,6 @@ The workspace is built for reviewing `--run-llm` and derived analysis output:
 
 The transcript header keeps the package title, line and overlay counts, summary,
 and generated main points visible before the raw transcript begins.
-
-![Transcript summary and main points](docs/readme-assets/review-ui-summary-main-points.jpg)
-
-![Selected overlay detail](docs/readme-assets/review-ui-overlay-detail.jpg)
 
 Selections are deep-linkable. The URL query parameters identify the transcript
 package and selected overlay, and the hash scrolls to a transcript section:
