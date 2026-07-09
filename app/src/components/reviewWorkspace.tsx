@@ -44,6 +44,8 @@ export function ReviewWorkspace(props: {
   sidebarReviewGroups: () => SidebarReviewGroup[];
   unmatchedItems: () => TranscriptOverlay[];
 }) {
+  // These props are all accessors/callbacks, so unpacking them does not freeze reactive values.
+  /* eslint-disable solid/reactivity */
   const {
     isLoading,
     initialLibrary, selectedPackage, freshPackageName, transcriptLines, processingPackageName,
@@ -52,6 +54,7 @@ export function ReviewWorkspace(props: {
     activeProjectRecordings, openProjectRecording, jumpTo, overlays, selectedOverlay, selectOverlay, audioUrl,
     selectedPackageQuestions, sidebarReviewGroups, unmatchedItems,
   } = props;
+  /* eslint-enable solid/reactivity */
   const [activeSectionId, setActiveSectionId] = createSignal("");
 
   const updateActiveSection = () => {

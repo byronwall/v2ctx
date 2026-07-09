@@ -1,4 +1,4 @@
-import { createSignal, onCleanup, onMount } from "solid-js";
+import { createEffect, createSignal, onCleanup, onMount } from "solid-js";
 import type { JSX } from "solid-js";
 import type { LibraryLoadResult } from "../reviewTypes";
 import { copyMarkdown, downloadMarkdownFile } from "../markdown";
@@ -27,6 +27,13 @@ export function ExportMarkdownActions(props: {
     return "Copy Markdown";
   };
   const hasMarkdown = () => !!props.markdown().trim();
+  const copyMarkdownToClipboard = async () => {
+    const markdown = props.markdown().trim();
+    if (!markdown) return;
+    const copied = await copyMarkdown(markdown);
+    setCopyStatus(copied ? "copied" : "failed");
+    resetStatusSoon();
+  };
 
   return (
     <div class="markdown-export-actions" aria-label={`Export ${props.label}`}>
@@ -34,13 +41,7 @@ export function ExportMarkdownActions(props: {
         variant="primary"
         size={props.size}
         disabled={!hasMarkdown()}
-        onClick={async () => {
-          const markdown = props.markdown().trim();
-          if (!markdown) return;
-          const copied = await copyMarkdown(markdown);
-          setCopyStatus(copied ? "copied" : "failed");
-          resetStatusSoon();
-        }}
+        onClick={() => void copyMarkdownToClipboard()}
       >
         {copyLabel()}
       </ActionButton>
@@ -83,26 +84,27 @@ export function MarkdownExportMenu(props: {
     if (copyStatus() === "failed") return "Copy failed";
     return "Copy Markdown";
   };
+  const copyMarkdownToClipboard = async (close: () => void) => {
+    const markdown = props.markdown().trim();
+    if (!markdown) return;
+    const copied = await copyMarkdown(markdown);
+    setCopyStatus(copied ? "copied" : "failed");
+    resetStatusSoon();
+    if (copied) close();
+  };
 
   return (
     <Popover
       class="markdown-export-menu"
       panelClass="markdown-export-popover"
       triggerLabel={`Export ${props.label}`}
-      trigger={<span class="kebab-icon" aria-hidden="true"></span>}
+      trigger={<span class="kebab-icon" aria-hidden="true" />}
       content={({ close }) => (
         <>
           <ActionButton
             variant="menu"
             disabled={!hasMarkdown()}
-            onClick={async () => {
-              const markdown = props.markdown().trim();
-              if (!markdown) return;
-              const copied = await copyMarkdown(markdown);
-              setCopyStatus(copied ? "copied" : "failed");
-              resetStatusSoon();
-              if (copied) close();
-            }}
+            onClick={() => void copyMarkdownToClipboard(close)}
           >
             {copyLabel()}
           </ActionButton>
@@ -148,6 +150,14 @@ export function ProjectExportMenu(props: {
     if (copyStatus() === "failed") return "Copy failed";
     return "Copy";
   };
+  const copyMarkdownToClipboard = async (close: () => void) => {
+    const markdown = props.markdown().trim();
+    if (!markdown) return;
+    const copied = await copyMarkdown(markdown);
+    setCopyStatus(copied ? "copied" : "failed");
+    resetStatusSoon();
+    if (copied) close();
+  };
 
   return (
     <Popover
@@ -166,18 +176,11 @@ export function ProjectExportMenu(props: {
           >
             Rename project
           </ActionButton>
-          <span class="review-actions-divider" aria-hidden="true"></span>
+          <span class="review-actions-divider" aria-hidden="true" />
           <ActionButton
             variant="menu"
             disabled={!hasMarkdown()}
-            onClick={async () => {
-              const markdown = props.markdown().trim();
-              if (!markdown) return;
-              const copied = await copyMarkdown(markdown);
-              setCopyStatus(copied ? "copied" : "failed");
-              resetStatusSoon();
-              if (copied) close();
-            }}
+            onClick={() => void copyMarkdownToClipboard(close)}
           >
             {copyLabel()}
           </ActionButton>
@@ -193,7 +196,7 @@ export function ProjectExportMenu(props: {
           >
             Download
           </ActionButton>
-          <span class="review-actions-divider" aria-hidden="true"></span>
+          <span class="review-actions-divider" aria-hidden="true" />
           <ActionButton
             variant="menu"
             class="app-button-menu-danger"
@@ -285,6 +288,14 @@ export function ReviewActionsMenu(props: {
     if (copyStatus() === "failed") return "Copy failed";
     return "Copy Markdown";
   };
+  const copyMarkdownToClipboard = async (close: () => void) => {
+    const markdown = props.markdown().trim();
+    if (!markdown) return;
+    const copied = await copyMarkdown(markdown);
+    setCopyStatus(copied ? "copied" : "failed");
+    resetStatusSoon();
+    if (copied) close();
+  };
 
   return (
     <Popover
@@ -324,18 +335,11 @@ export function ReviewActionsMenu(props: {
         >
           Hide memo
         </ActionButton>
-        <span class="review-actions-divider" aria-hidden="true"></span>
+        <span class="review-actions-divider" aria-hidden="true" />
         <ActionButton
           variant="menu"
           disabled={!hasMarkdown()}
-          onClick={async () => {
-            const markdown = props.markdown().trim();
-            if (!markdown) return;
-            const copied = await copyMarkdown(markdown);
-            setCopyStatus(copied ? "copied" : "failed");
-            resetStatusSoon();
-            if (copied) close();
-          }}
+          onClick={() => void copyMarkdownToClipboard(close)}
         >
           {copyLabel()}
         </ActionButton>
@@ -376,7 +380,7 @@ export function ActionButton(props: {
       }}
       type={props.type ?? "button"}
       disabled={props.disabled}
-      onClick={props.onClick}
+      onClick={(event) => props.onClick?.(event)}
     >
       {props.children}
     </button>
@@ -384,7 +388,9 @@ export function ActionButton(props: {
 }
 
 export function AwaitResource(props: { resource: () => LibraryLoadResult | undefined; children: JSX.Element }) {
-  props.resource();
+  createEffect(() => {
+    props.resource();
+  });
   return <>{props.children}</>;
 }
 

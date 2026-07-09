@@ -226,7 +226,7 @@ export function ProjectsWorkspace(props: {
           <button class="primary-action" type="submit" disabled={!props.newProjectName.trim()}>
             Create
           </button>
-          <button class="secondary-action" type="button" onClick={props.onCancelProject}>
+          <button class="secondary-action" type="button" onClick={() => props.onCancelProject()}>
             Cancel
           </button>
         </form>
@@ -256,7 +256,7 @@ export function ProjectsWorkspace(props: {
           <article class="project-row unassigned-project-row" role="row">
             <div class="project-cell project-meta-cell" role="cell">
               <div class="project-name-line">
-                <span class="project-folder unassigned-folder"></span>
+                <span class="project-folder unassigned-folder" />
                 <h3>No project assigned</h3>
               </div>
               <div class="project-facts">
@@ -309,7 +309,7 @@ export function ProjectsWorkspace(props: {
               >
                 <div class="project-cell project-meta-cell" role="cell">
                   <div class="project-name-line">
-                    <span class="project-folder" style={{ "background-color": row.project.color }}></span>
+                    <span class="project-folder" style={{ "background-color": row.project.color }} />
                     <h3>{row.project.name}</h3>
                     <ProjectExportMenu
                       markdown={() => props.projectMarkdown(row)}
@@ -369,9 +369,9 @@ export function ProjectRecordingCardView(props: {
     <button
       class="project-recording-card"
       type="button"
-      onClick={props.onOpen}
-      onPointerDown={props.onPointerDown}
-      onPointerUp={props.onPointerUp}
+      onClick={() => props.onOpen()}
+      onPointerDown={(event) => props.onPointerDown?.(event)}
+      onPointerUp={(event) => props.onPointerUp?.(event)}
     >
       <span class="recording-card-top">
         <strong>{props.recording.title}</strong>
@@ -531,7 +531,7 @@ export function MoveRecordingMenu(props: {
                     close();
                   }}
                 >
-                  <span class="project-color-dot" style={{ "background-color": project.color }}></span>
+                  <span class="project-color-dot" style={{ "background-color": project.color }} />
                   <span>{project.name}</span>
                 </button>
               )}
@@ -621,27 +621,33 @@ export function WaveformBars(props: {
   startMs?: number;
   endMs?: number;
 }) {
-  const [bars, setBars] = createSignal<number[]>(fallbackWaveformBars(props.seed));
+  const [bars, setBars] = createSignal<number[]>([]);
 
   createEffect(() => {
+    const seed = props.seed;
     const url = props.audioUrl;
+    const packageName = props.packageName;
+    const audioSize = props.audioSize;
+    const audioMtimeMs = props.audioMtimeMs;
+    const startMs = props.startMs;
+    const endMs = props.endMs;
     if (!url || typeof window === "undefined") {
-      setBars(fallbackWaveformBars(props.seed));
+      setBars(fallbackWaveformBars(seed));
       return;
     }
     let cancelled = false;
     void loadWaveformCache({
-      packageName: props.packageName,
+      packageName,
       audioUrl: url,
-      audioSize: props.audioSize,
-      audioMtimeMs: props.audioMtimeMs,
+      audioSize,
+      audioMtimeMs,
     })
       .then((nextBars) => {
-        const rangeBars = nextBars ? waveformBarsForRange(nextBars, props.startMs, props.endMs) : [];
-        if (!cancelled) setBars(rangeBars.length ? rangeBars : fallbackWaveformBars(props.seed));
+        const rangeBars = nextBars ? waveformBarsForRange(nextBars, startMs, endMs) : [];
+        if (!cancelled) setBars(rangeBars.length ? rangeBars : fallbackWaveformBars(seed));
       })
       .catch(() => {
-        if (!cancelled) setBars(fallbackWaveformBars(props.seed));
+        if (!cancelled) setBars(fallbackWaveformBars(seed));
       });
     onCleanup(() => {
       cancelled = true;
@@ -650,7 +656,7 @@ export function WaveformBars(props: {
 
   return (
     <span class="waveform-bars" aria-hidden="true">
-      <For each={bars()}>{(bar) => <span style={{ height: `${Math.max(3, Math.round(bar * 28))}px` }}></span>}</For>
+      <For each={bars()}>{(bar) => <span style={{ height: `${Math.max(3, Math.round(bar * 28))}px` }} />}</For>
     </span>
   );
 }

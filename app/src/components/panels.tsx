@@ -25,7 +25,7 @@ export function ProcessHelpModal(props: { onClose: () => void }) {
             <span class="eyebrow">Process overview</span>
             <h2 id="process-help-title">From voice memo to reviewable context</h2>
           </div>
-          <button class="modal-close" type="button" aria-label="Close help" onClick={props.onClose}>
+          <button class="modal-close" type="button" aria-label="Close help" onClick={() => props.onClose()}>
             x
           </button>
         </header>
@@ -177,9 +177,9 @@ export function MemoListSkeleton() {
       <For each={[0, 1, 2, 3, 4, 5, 6]}>
         {(item) => (
           <div class="skeleton-card" data-variant={item % 3}>
-            <span class="skeleton-line title"></span>
-            <span class="skeleton-line short"></span>
-            <span class="skeleton-line meta"></span>
+            <span class="skeleton-line title" />
+            <span class="skeleton-line short" />
+            <span class="skeleton-line meta" />
           </div>
         )}
       </For>
@@ -192,31 +192,31 @@ export function TranscriptPaneSkeleton() {
     <>
       <div class="transcript-toolbar skeleton-toolbar" aria-live="polite" aria-label="Loading transcript">
         <div>
-          <span class="skeleton-line heading"></span>
-          <span class="skeleton-line meta"></span>
+          <span class="skeleton-line heading" />
+          <span class="skeleton-line meta" />
         </div>
-        <span class="skeleton-button"></span>
+        <span class="skeleton-button" />
         <div class="overlay-filter skeleton-filter">
           <For each={[0, 1, 2, 3, 4, 5]}>
-            {() => <span class="skeleton-pill"></span>}
+            {() => <span class="skeleton-pill" />}
           </For>
         </div>
       </div>
       <div class="skeleton-summary">
-        <span class="skeleton-line label"></span>
-        <span class="skeleton-line wide"></span>
-        <span class="skeleton-line medium"></span>
+        <span class="skeleton-line label" />
+        <span class="skeleton-line wide" />
+        <span class="skeleton-line medium" />
       </div>
       <div class="transcript-document skeleton-document">
         <For each={[0, 1, 2]}>
           {() => (
             <article class="transcript-section skeleton-section">
-              <span class="skeleton-line section-title"></span>
+              <span class="skeleton-line section-title" />
               <For each={[0, 1, 2, 3, 4]}>
                 {() => (
                   <p class="transcript-line skeleton-transcript-line">
-                    <span class="skeleton-time"></span>
-                    <span class="skeleton-line transcript"></span>
+                    <span class="skeleton-time" />
+                    <span class="skeleton-line transcript" />
                   </p>
                 )}
               </For>
@@ -232,13 +232,13 @@ export function EvidencePaneSkeleton() {
   return (
     <div class="skeleton-evidence" aria-live="polite" aria-label="Loading evidence">
       <PanelTitle title="Audio" />
-      <span class="skeleton-audio"></span>
+      <span class="skeleton-audio" />
       <PanelTitle title="Selected overlay" />
       <div class="overlay-detail">
-        <span class="skeleton-line short"></span>
-        <span class="skeleton-line heading"></span>
-        <span class="skeleton-line wide"></span>
-        <span class="skeleton-line medium"></span>
+        <span class="skeleton-line short" />
+        <span class="skeleton-line heading" />
+        <span class="skeleton-line wide" />
+        <span class="skeleton-line medium" />
       </div>
     </div>
   );

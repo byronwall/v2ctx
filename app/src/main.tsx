@@ -489,7 +489,7 @@ function App() {
   function restoreAndOpenPackage(memoPackage: MemoPackage) {
     restorePackage(memoPackage.name);
     setWorkspaceView("review");
-    window.requestAnimationFrame(() => selectPackage(memoPackage));
+    selectPackage(memoPackage);
   }
 
   function createProject() {
