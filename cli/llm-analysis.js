@@ -12,6 +12,7 @@ const REPO_ROOT = path.resolve(MODULE_DIR, "..");
 
 export const LLM_PROMPT_VERSION = "transcript-llm-analysis@2026-07-03.1";
 export const FOLLOW_UP_QUESTIONS_PROMPT_VERSION = "transcript-follow-up-questions@2026-07-08.1";
+export const NEXT_TOPICS_PROMPT_VERSION = "voice-memos-next-topics@2026-07-09.1";
 export const DEFAULT_LLM_PROVIDER = "openai";
 export const DEFAULT_LLM_MODEL = "gpt-5.4-mini";
 
@@ -44,6 +45,7 @@ const SHARED_TRANSCRIPT_INSTRUCTIONS = [
 const TRANSCRIPT_PLAN_SCHEMA_NAME = "transcript_plan";
 const TRANSCRIPT_EXTRACTION_SCHEMA_NAME = "transcript_extraction";
 const FOLLOW_UP_QUESTIONS_SCHEMA_NAME = "follow_up_questions";
+const NEXT_TOPICS_SCHEMA_NAME = "next_topics";
 const DEFAULT_LLM_EXTRACTION_CONCURRENCY = 3;
 
 const OPENAI_STANDARD_PRICES = {
@@ -310,6 +312,72 @@ export async function runFollowUpQuestionsAnalysis(packageDir, opts = {}) {
     provider,
     followUpQuestionsPath,
     count: questions.length,
+    usage: usageSummaryForJson(usageAccumulatorFromCall(provider, model, call)),
+  };
+}
+
+export async function runNextTopicsAnalysis(libraryRoot, opts = {}) {
+  const root = path.resolve(expandHome(libraryRoot));
+  const analysisDir = path.join(root, "analysis");
+  const provider = opts.llmProvider || DEFAULT_LLM_PROVIDER;
+  const model = opts.llmModel || DEFAULT_LLM_MODEL;
+
+  if (provider !== "openai") {
+    throw new Error(`Unsupported LLM provider: ${provider}. Only "openai" is supported.`);
+  }
+
+  const corpus = await readSummaryCorpus(root, opts.packageNames, opts.projects);
+  if (!corpus.packages.length) {
+    throw new Error(`No transcript summaries found under ${root}. Run LLM analysis on at least one memo first.`);
+  }
+
+  const startedAt = new Date(parseInt(process.env.V2C_NOW || Date.now(), 10)).toISOString();
+  const startedMs = Date.now();
+  step(`LLM next topics: ${path.basename(root)}`);
+  info(`provider=${provider} model=${model} summaries=${corpus.packages.length}`);
+  await fs.mkdir(analysisDir, { recursive: true });
+  const client = opts.openAIClient || createOpenAIClient(root);
+  const call = await generateNextTopics(client, { model, corpus });
+  const topics = normalizeNextTopics(call.data.topics || [], corpus).slice(0, 30);
+  const nextTopicsPath = path.join(analysisDir, "next-topics.json");
+  await fs.writeFile(
+    nextTopicsPath,
+    `${JSON.stringify(
+      {
+        promptVersion: NEXT_TOPICS_PROMPT_VERSION,
+        model,
+        provider,
+        generatedAt: startedAt,
+        source: {
+          root,
+          packageCount: corpus.packages.length,
+          packages: corpus.packages.map((item) => ({
+            packageName: item.packageName,
+            title: item.title,
+            sectionCount: item.sections.length,
+            projectNames: item.projectNames,
+          })),
+          projects: (corpus.projects || []).map((project) => ({
+            name: project.name,
+            description: project.description,
+            packageCount: project.recordingTitles.length,
+          })),
+        },
+        usage: usageSummaryForJson(usageAccumulatorFromCall(provider, model, call)),
+        topics,
+      },
+      null,
+      2,
+    )}\n`,
+    "utf8",
+  );
+  done(`Next topics complete in ${formatDuration(Date.now() - startedMs)}`);
+  return {
+    root,
+    model,
+    provider,
+    nextTopicsPath,
+    count: topics.length,
     usage: usageSummaryForJson(usageAccumulatorFromCall(provider, model, call)),
   };
 }
@@ -641,6 +709,45 @@ async function generateFollowUpQuestions(client, { model, transcript, segments, 
   });
 }
 
+async function generateNextTopics(client, { model, corpus }) {
+  return callStructured(client, {
+    model,
+    name: "next_topics",
+    schemaName: NEXT_TOPICS_SCHEMA_NAME,
+    schema: nextTopicsSchema(),
+    promptCacheKey: promptCacheKeyForSummaryCorpus(model, corpus),
+    input: [
+      {
+        role: "developer",
+        content: [
+          "You propose future voice memo discussion topics from existing voice memo summaries and project groupings.",
+          "Use only the provided project names/descriptions, package titles, transcript summaries, themes, top bullets, and section summaries.",
+          "Do not ask for full transcripts and do not invent unrelated personal history.",
+          "The speaker records exploratory memos; topics should be specific enough to sustain a 20 to 30 minute spoken discussion at the speaker's current pacing.",
+          "Each proposed topic must be additive: it should create a new angle, bridge multiple existing ideas, sharpen an unresolved decision, or extend an idea into implementation, writing, or product strategy.",
+        ].join("\n"),
+      },
+      {
+        role: "user",
+        content: [
+          "Existing memo summary corpus:",
+          JSON.stringify(corpus, null, 2),
+          "",
+          "Task: generate exactly 30 topics to discuss next.",
+          "Each topic should extend, connect, or deepen the ideas already present in the summaries.",
+          "Do not simply restate an existing summary, top bullet, section title, or theme.",
+          "Avoid generic prompts. Prefer concrete product, implementation, writing, workflow, architecture, or decision topics.",
+          "Write each topic as something the speaker could press record and discuss for 20 to 30 minutes.",
+          "For each topic include a specific title, a detailed description, 3 to 5 talking points, 3 to 4 freeform tags, concise rationale grounded in the existing summaries, and 1 to 2 lines explaining why this topic is additive instead of repetitive.",
+          "Choose tags from the actual corpus patterns. Do not use a prescribed taxonomy; invent concise tags that help filter this specific set of generated topics.",
+          "Use projectNames to list the provided projects that are directly relevant to the topic. Return an empty array if no project is directly relevant.",
+          "Use relatedSources to cite the most relevant existing memo titles and section titles from the provided corpus.",
+        ].join("\n"),
+      },
+    ],
+  });
+}
+
 async function callStructured(client, { model, name, schemaName, schema, input, promptCacheKey }) {
   const response = await client.responses.create({
     model,
@@ -699,6 +806,21 @@ function promptCacheKeyForTranscript(model, transcript) {
     .digest("hex")
     .slice(0, 32);
   return `v2c-transcript-${hash}`;
+}
+
+function promptCacheKeyForSummaryCorpus(model, corpus) {
+  const hash = crypto
+    .createHash("sha256")
+    .update(
+      JSON.stringify({
+        promptVersion: NEXT_TOPICS_PROMPT_VERSION,
+        model,
+        corpus,
+      }),
+    )
+    .digest("hex")
+    .slice(0, 32);
+  return `v2c-next-topics-${hash}`;
 }
 
 function extractOutputText(response) {
@@ -943,6 +1065,179 @@ function followUpQuestionsSchema() {
       },
     },
   };
+}
+
+function nextTopicsSchema() {
+  return {
+    type: "object",
+    additionalProperties: false,
+    required: ["topics"],
+    properties: {
+      topics: {
+        type: "array",
+        minItems: 30,
+        maxItems: 30,
+        items: {
+          type: "object",
+          additionalProperties: false,
+          required: ["title", "description", "talkingPoints", "tags", "rationale", "additiveJustification", "projectNames", "relatedSources"],
+          properties: {
+            title: { type: "string" },
+            description: { type: "string" },
+            talkingPoints: {
+              type: "array",
+              minItems: 3,
+              maxItems: 5,
+              items: { type: "string" },
+            },
+            tags: {
+              type: "array",
+              minItems: 3,
+              maxItems: 4,
+              items: { type: "string" },
+            },
+            rationale: { type: "string" },
+            additiveJustification: { type: "string" },
+            projectNames: {
+              type: "array",
+              items: { type: "string" },
+            },
+            relatedSources: {
+              type: "array",
+              items: {
+                type: "object",
+                additionalProperties: false,
+                required: ["packageTitle", "sectionTitle"],
+                properties: {
+                  packageTitle: { type: "string" },
+                  sectionTitle: { type: "string" },
+                },
+              },
+            },
+          },
+        },
+      },
+    },
+  };
+}
+
+async function readSummaryCorpus(root, packageNames, projects) {
+  const allowedPackageNames = packageNames?.length ? new Set(packageNames) : null;
+  const normalizedProjects = normalizeProjectContext(projects, allowedPackageNames);
+  const projectNamesByPackage = new Map();
+  for (const project of normalizedProjects) {
+    for (const packageName of project.recordingNames) {
+      const names = projectNamesByPackage.get(packageName) || [];
+      names.push(project.name);
+      projectNamesByPackage.set(packageName, names);
+    }
+    for (const section of project.sectionRefs) {
+      const names = projectNamesByPackage.get(section.packageName) || [];
+      if (!names.includes(project.name)) names.push(project.name);
+      projectNamesByPackage.set(section.packageName, names);
+    }
+  }
+  const entries = await fs.readdir(root, { withFileTypes: true }).catch(() => []);
+  const packages = [];
+  for (const entry of entries) {
+    if (!entry.isDirectory() || !entry.name.endsWith("-context")) continue;
+    if (allowedPackageNames && !allowedPackageNames.has(entry.name)) continue;
+    const packageDir = path.join(root, entry.name);
+    const summary = await readJson(path.join(packageDir, "analysis", "transcript-summary.json"));
+    if (!summary?.summary && !summary?.title) continue;
+    packages.push({
+      packageName: entry.name,
+      title: String(summary.title || entry.name).trim(),
+      projectNames: projectNamesByPackage.get(entry.name) || [],
+      summary: String(summary.summary || "").trim(),
+      topBullets: stringArray(summary.topBullets).slice(0, 8),
+      themes: stringArray(summary.themes).slice(0, 10),
+      sections: (Array.isArray(summary.sections) ? summary.sections : [])
+        .map((section) => ({
+          title: String(section?.title || "").trim(),
+          summary: String(section?.summary || "").trim(),
+        }))
+        .filter((section) => section.title || section.summary),
+    });
+  }
+  return {
+    root,
+    generatedFrom: "analysis/transcript-summary.json",
+    projects: normalizedProjects.map((project) => ({
+      name: project.name,
+      description: project.description,
+      recordingTitles: project.recordingNames
+        .map((packageName) => packages.find((item) => item.packageName === packageName)?.title)
+        .filter(Boolean),
+      sectionRefs: project.sectionRefs
+        .map((section) => ({
+          packageTitle: packages.find((item) => item.packageName === section.packageName)?.title || section.packageName,
+          sectionTitle: section.title,
+        }))
+        .filter((section) => section.sectionTitle),
+    })),
+    packages: packages.sort((a, b) => b.packageName.localeCompare(a.packageName)),
+  };
+}
+
+function normalizeNextTopics(items, corpus) {
+  const knownPackageTitles = new Set(corpus.packages.map((item) => item.title));
+  const knownProjectNames = new Set((corpus.projects || []).map((item) => item.name));
+  return (items || [])
+    .filter((item) => item?.title)
+    .map((item, index) => ({
+      id: `next_topic_${String(index + 1).padStart(3, "0")}`,
+      title: String(item.title || "").trim().slice(0, 160),
+      description: String(item.description || "").trim(),
+      talkingPoints: stringArray(item.talkingPoints).slice(0, 5),
+      tags: uniqueStringArray(item.tags).slice(0, 4),
+      rationale: String(item.rationale || "").trim(),
+      additiveJustification: String(item.additiveJustification || "").trim(),
+      projectNames: stringArray(item.projectNames)
+        .filter((projectName) => knownProjectNames.has(projectName))
+        .slice(0, 3),
+      relatedSources: (Array.isArray(item.relatedSources) ? item.relatedSources : [])
+        .map((source) => ({
+          packageTitle: String(source?.packageTitle || "").trim(),
+          sectionTitle: String(source?.sectionTitle || "").trim(),
+        }))
+        .filter((source) => source.packageTitle || source.sectionTitle)
+        .filter((source) => !source.packageTitle || knownPackageTitles.has(source.packageTitle))
+        .slice(0, 4),
+    }));
+}
+
+function stringArray(value) {
+  return Array.isArray(value) ? value.map((item) => String(item || "").trim()).filter(Boolean) : [];
+}
+
+function uniqueStringArray(value) {
+  const seen = new Set();
+  return stringArray(value).filter((item) => {
+    const key = item.toLowerCase();
+    if (seen.has(key)) return false;
+    seen.add(key);
+    return true;
+  });
+}
+
+function normalizeProjectContext(projects, allowedPackageNames) {
+  if (!Array.isArray(projects)) return [];
+  return projects
+    .map((project) => ({
+      name: String(project?.name || "").trim(),
+      description: String(project?.description || "").trim(),
+      recordingNames: stringArray(project?.recordingNames)
+        .filter((packageName) => !allowedPackageNames || allowedPackageNames.has(packageName)),
+      sectionRefs: (Array.isArray(project?.sectionRefs) ? project.sectionRefs : [])
+        .map((section) => ({
+          packageName: String(section?.packageName || "").trim(),
+          title: String(section?.title || "").trim(),
+        }))
+        .filter((section) => section.packageName && section.title)
+        .filter((section) => !allowedPackageNames || allowedPackageNames.has(section.packageName)),
+    }))
+    .filter((project) => project.name && (project.recordingNames.length || project.sectionRefs.length));
 }
 
 async function readTranscriptContext(root, sourceSegments) {

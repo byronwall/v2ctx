@@ -141,6 +141,44 @@ export type FollowUpQuestionsArtifact = {
   questions: FollowUpQuestion[];
 };
 
+export type NextTopic = {
+  id: string;
+  title: string;
+  description: string;
+  talkingPoints: string[];
+  tags: string[];
+  rationale: string;
+  additiveJustification: string;
+  projectNames: string[];
+  relatedSources: Array<{
+    packageTitle: string;
+    sectionTitle: string;
+  }>;
+};
+
+export type NextTopicsArtifact = {
+  promptVersion?: string;
+  model?: string;
+  provider?: string;
+  generatedAt?: string;
+  source?: {
+    root?: string;
+    packageCount?: number;
+    packages?: Array<{
+      packageName: string;
+      title: string;
+      sectionCount: number;
+      projectNames?: string[];
+    }>;
+    projects?: Array<{
+      name: string;
+      description?: string;
+      packageCount: number;
+    }>;
+  };
+  topics: NextTopic[];
+};
+
 export type MemoPackage = {
   name: string;
   title: string;
@@ -160,4 +198,5 @@ export type VoiceMemoLibrary = {
   root: string;
   packages: MemoPackage[];
   generatedAt: string;
+  nextTopics?: NextTopicsArtifact;
 };

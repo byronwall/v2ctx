@@ -3,7 +3,7 @@ import type { FollowUpQuestion, ReviewItem, ReviewType, TranscriptItem, VoiceMem
 export type OverlayType = ReviewType | "claimish";
 export type AnchorQuality = "excerpt" | "fuzzy" | "time" | "segment" | "unmatched";
 export type PackageSortMode = "updated" | "needs_process";
-export type WorkspaceView = "review" | "projects" | "items" | "memos";
+export type WorkspaceView = "review" | "projects" | "items" | "topics" | "memos";
 export type CollectedItemType = "question" | ReviewType;
 export type ProjectCardCountType = "question" | "task" | "idea" | "quote" | "blog_seed" | "sensitive_flag";
 

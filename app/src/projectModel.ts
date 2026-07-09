@@ -266,7 +266,7 @@ export function collectedReviewItemContent(item: ReviewItem): string {
 }
 
 export function collectedReviewItemQuote(item: ReviewItem): string {
-  return item.item?.excerpt?.trim() || item.body?.trim() || item.item?.text?.trim() || "";
+  return item.item?.excerpt?.trim() || "";
 }
 
 export function collectedQuestionContent(question: FollowUpQuestion): string {

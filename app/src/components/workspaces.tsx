@@ -1,7 +1,7 @@
-import { For, Show, createEffect, createSignal, onCleanup, onMount } from "solid-js";
+import { For, Show, createEffect, createMemo, createSignal, onCleanup, onMount } from "solid-js";
 import type { JSX } from "solid-js";
 import { Portal } from "solid-js/web";
-import type { MemoPackage } from "../types";
+import type { MemoPackage, NextTopicsArtifact } from "../types";
 import type { CollectedItemRow, CollectedItemType, ProjectCardCountType, ProjectRecordingCard, ProjectRecord, ProjectRow } from "../reviewTypes";
 import { collectedTypeLabels, projectCardCountLabels, projectCardCountOptions } from "../reviewTypes";
 import { formatDuration, packageDateLabel } from "../datetime";
@@ -11,30 +11,216 @@ import { collectedItemFilterOptions, projectDateRange, relativeDate } from "../p
 import { fallbackWaveformBars, loadWaveformCache, waveformBarsForRange } from "../waveform";
 import { ActionButton, EmptyState, ProjectExportMenu } from "./common";
 
+export function NextTopicsWorkspace(props: {
+  artifact?: NextTopicsArtifact;
+  packageCount: number;
+  isGenerating: boolean;
+  onRegenerate: () => void;
+}) {
+  const generatedLabel = () => {
+    if (!props.artifact?.generatedAt) return "";
+    const date = new Date(props.artifact.generatedAt);
+    if (Number.isNaN(date.getTime())) return props.artifact.generatedAt;
+    return date.toLocaleString();
+  };
+  const sourceCount = () => props.artifact?.source?.packageCount ?? props.packageCount;
+  const [selectedTag, setSelectedTag] = createSignal("all");
+  const tagOptions = createMemo(() => {
+    const counts = new Map<string, number>();
+    for (const topic of props.artifact?.topics ?? []) {
+      for (const tag of topic.tags ?? []) {
+        counts.set(tag, (counts.get(tag) ?? 0) + 1);
+      }
+    }
+    return [...counts.entries()]
+      .map(([tag, count]) => ({ tag, count }))
+      .sort((a, b) => b.count - a.count || a.tag.localeCompare(b.tag));
+  });
+  const filteredTopics = createMemo(() => {
+    const tag = selectedTag();
+    const topics = props.artifact?.topics ?? [];
+    return tag === "all" ? topics : topics.filter((topic) => topic.tags?.includes(tag));
+  });
+  const sourcePackageName = (packageTitle: string) =>
+    props.artifact?.source?.packages?.find((memoPackage) => memoPackage.title === packageTitle)?.packageName ?? "";
+  const sourceHref = (source: { packageTitle: string; sectionTitle: string }) => {
+    const packageName = sourcePackageName(source.packageTitle);
+    return packageName ? `?view=review&transcript=${encodeURIComponent(packageName)}` : "";
+  };
+  const sourceLabel = (source: { packageTitle: string; sectionTitle: string }) =>
+    [source.packageTitle, source.sectionTitle].filter(Boolean).join(": ");
+
+  createEffect(() => {
+    const tag = selectedTag();
+    if (tag !== "all" && !tagOptions().some((option) => option.tag === tag)) setSelectedTag("all");
+  });
+
+  return (
+    <section class="next-topics-workspace" aria-label="Topics to discuss next">
+      <header class="next-topics-toolbar">
+        <div>
+          <h2>Topics to discuss next</h2>
+          <p class="next-topics-meta">
+            <span>{props.artifact?.topics.length ?? 0} topics</span>
+            <span>{sourceCount()} memos</span>
+            <Show when={generatedLabel()}>
+              {(label) => <span>{label()}</span>}
+            </Show>
+          </p>
+        </div>
+        <ActionButton
+          variant="primary"
+          disabled={props.isGenerating || props.packageCount === 0}
+          onClick={() => props.onRegenerate()}
+        >
+          {props.isGenerating ? "Generating" : "Regenerate"}
+        </ActionButton>
+      </header>
+
+      <div class="next-topics-layout">
+        <Show when={tagOptions().length}>
+          <aside class="next-topics-filter" aria-label="Filter topics by tag">
+            <h3>Tags</h3>
+            <button
+              classList={{ selected: selectedTag() === "all" }}
+              type="button"
+              onClick={() => setSelectedTag("all")}
+            >
+              <span>All</span>
+              <strong>{props.artifact?.topics.length ?? 0}</strong>
+            </button>
+            <For each={tagOptions()}>
+              {(option) => (
+                <button
+                  classList={{ selected: selectedTag() === option.tag }}
+                  type="button"
+                  onClick={() => setSelectedTag(option.tag)}
+                >
+                  <span>{option.tag}</span>
+                  <strong>{option.count}</strong>
+                </button>
+              )}
+            </For>
+          </aside>
+        </Show>
+
+        <Show
+          when={props.artifact?.topics.length}
+          fallback={
+            <div class="next-topics-empty">
+              <EmptyState text="No generated topics yet. Run LLM summaries for your memos, then regenerate this view." />
+            </div>
+          }
+        >
+          <div class="next-topics-results">
+            <ol class="next-topics-list">
+              <For
+                each={filteredTopics()}
+                fallback={
+                  <li class="next-topics-empty-row">
+                    <EmptyState text="No topics match this tag." />
+                  </li>
+                }
+              >
+                {(topic, index) => (
+                  <li class="next-topic-card">
+                    <div class="next-topic-index">{String(index() + 1).padStart(2, "0")}</div>
+                    <article class="next-topic-main">
+                      <header class="next-topic-head">
+                        <h3>{topic.title}</h3>
+                        <Show when={(topic.projectNames?.length ?? 0) + (topic.tags?.length ?? 0)}>
+                          <div class="next-topic-meta">
+                            <For each={topic.projectNames ?? []}>
+                              {(projectName) => <span class="next-topic-project">{projectName}</span>}
+                            </For>
+                            <For each={topic.tags ?? []}>
+                              {(tag) => <span class="next-topic-tag">{tag}</span>}
+                            </For>
+                          </div>
+                        </Show>
+                      </header>
+                      <p class="next-topic-description">{topic.description}</p>
+                      <Show when={topic.talkingPoints.length}>
+                        <ul class="next-topic-points">
+                          <For each={topic.talkingPoints}>
+                            {(point) => <li>{point}</li>}
+                          </For>
+                        </ul>
+                      </Show>
+                      <Show when={topic.rationale}>
+                        <p class="next-topic-rationale">{topic.rationale}</p>
+                      </Show>
+                      <Show when={topic.additiveJustification}>
+                        <p class="next-topic-additive">{topic.additiveJustification}</p>
+                      </Show>
+                      <Show when={topic.relatedSources.length}>
+                        <footer class="next-topic-sources">
+                          <For each={topic.relatedSources}>
+                            {(source) => (
+                              <Show when={sourceHref(source)} fallback={<span>{sourceLabel(source)}</span>}>
+                                {(href) => (
+                                  <a href={href()}>
+                                    <span class="next-topic-waveform" aria-hidden="true">
+                                      <span />
+                                      <span />
+                                      <span />
+                                      <span />
+                                    </span>
+                                    <span>{sourceLabel(source)}</span>
+                                  </a>
+                                )}
+                              </Show>
+                            )}
+                          </For>
+                        </footer>
+                      </Show>
+                    </article>
+                  </li>
+                )}
+              </For>
+            </ol>
+          </div>
+        </Show>
+      </div>
+    </section>
+  );
+}
+
 export function CollectedItemsWorkspace(props: {
   rows: CollectedItemRow[];
-  totalCount: number;
   filter: CollectedItemType | "all";
   typeCounts: Map<CollectedItemType, number>;
   onFilter: (type: CollectedItemType | "all") => void;
   onOpen: (row: CollectedItemRow) => void;
 }) {
+  const pageSize = 50;
+  const [page, setPage] = createSignal(1);
   const filters = () => collectedItemFilterOptions(props.typeCounts);
+  const pageCount = createMemo(() => Math.max(1, Math.ceil(props.rows.length / pageSize)));
+  const pageStart = createMemo(() => (page() - 1) * pageSize);
+  const pageRows = createMemo(() => props.rows.slice(pageStart(), pageStart() + pageSize));
+  const pageRange = createMemo(() => {
+    if (!props.rows.length) return "0 of 0";
+    const start = pageStart() + 1;
+    const end = Math.min(pageStart() + pageSize, props.rows.length);
+    return `${start}-${end} of ${props.rows.length}`;
+  });
+  const shouldShowSource = (row: CollectedItemRow) => {
+    if (!row.source || row.source === row.time) return false;
+    return !/\.(m4a|mp3|wav|aac|flac|ogg)\b/i.test(row.source);
+  };
+
+  createEffect(() => {
+    props.filter;
+    props.rows.length;
+    setPage(1);
+  });
 
   return (
     <section class="collected-items-workspace" aria-label="Collected items">
-      <header class="collected-items-toolbar">
-        <div>
-          <h2>Collected items</h2>
-          <p>
-            {props.rows.length} shown · {props.totalCount} total questions, tasks, claims, quotes, and flags
-          </p>
-        </div>
-      </header>
-
       <div class="collected-items-layout">
         <aside class="collected-items-filter" aria-label="Filter collected items by type">
-          <h3>Type</h3>
+          <h3>Show</h3>
           <For each={filters()}>
             {(filter) => (
               <button
@@ -53,26 +239,45 @@ export function CollectedItemsWorkspace(props: {
           <div class="collected-items-head" role="row">
             <span role="columnheader">Type</span>
             <span role="columnheader">Item</span>
-            <span role="columnheader">Original quote</span>
             <span role="columnheader">Memo</span>
+            <span role="columnheader">Quote</span>
           </div>
-          <For each={props.rows} fallback={<EmptyState text="No collected items match this filter." />}>
+          <Show when={pageCount() > 1}>
+            <div class="collected-items-pager" aria-label="Items pagination">
+              <span>{pageRange()}</span>
+              <div>
+                <button type="button" disabled={page() <= 1} onClick={() => setPage((current) => Math.max(1, current - 1))}>
+                  Prev
+                </button>
+                <button type="button" disabled={page() >= pageCount()} onClick={() => setPage((current) => Math.min(pageCount(), current + 1))}>
+                  Next
+                </button>
+              </div>
+            </div>
+          </Show>
+          <For each={pageRows()} fallback={<EmptyState text="No items match this filter." />}>
             {(row) => (
               <button class="collected-item-row" type="button" role="row" onClick={() => props.onOpen(row)}>
                 <span class="collected-item-cell collected-item-type-cell" role="cell">
                   <span class={`type type-${row.type}`}>{collectedTypeLabels[row.type]}</span>
-                  <span>{row.time}</span>
                 </span>
                 <span class="collected-item-cell collected-item-content-cell" role="cell">
-                  <strong>{row.title}</strong>
-                  <span>{row.content}</span>
-                </span>
-                <span class="collected-item-cell collected-item-quote-cell" role="cell">
-                  {row.quote || "No source quote captured."}
+                  <span class="collected-item-title-line">
+                    <strong>{row.title}</strong>
+                  </span>
+                  <Show when={row.content && row.content !== row.title}>
+                    <span>{row.content}</span>
+                  </Show>
                 </span>
                 <span class="collected-item-cell collected-item-source-cell" role="cell">
                   <strong>{row.packageTitle}</strong>
-                  <span>{row.source}</span>
+                  <span>{row.time}</span>
+                  <Show when={shouldShowSource(row)}>
+                    <span>{row.source}</span>
+                  </Show>
+                </span>
+                <span class="collected-item-cell collected-item-quote-cell" role="cell">
+                  <Show when={row.quote}>{row.quote}</Show>
                 </span>
               </button>
             )}

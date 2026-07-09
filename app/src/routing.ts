@@ -14,7 +14,7 @@ export function readUrlSelection(): UrlSelection {
 }
 
 export function isWorkspaceView(value: string | null): value is WorkspaceView {
-  return value === "review" || value === "projects" || value === "items" || value === "memos";
+  return value === "review" || value === "projects" || value === "items" || value === "topics" || value === "memos";
 }
 
 export function overlayIdForPackage(packageName: string, overlayId: string | undefined, packages: MemoPackage[]): string {

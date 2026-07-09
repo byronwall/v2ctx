@@ -1,7 +1,7 @@
 import { Show, createEffect, createMemo, createResource, createSignal, onCleanup, onMount, untrack } from "solid-js";
 import { render } from "solid-js/web";
 import { fileUrl } from "./packageLoader";
-import type { MemoPackage, VoiceMemoLibrary } from "./types";
+import type { MemoPackage, NextTopicsArtifact, VoiceMemoLibrary } from "./types";
 import type { CollectedItemRow, ProjectRecord, ProjectRecordingCard, TranscriptOverlay, TranscriptSection, WorkspaceView, OverlayType, CollectedItemType, ProjectCardCountType } from "./reviewTypes";
 import { defaultProjectCardCountTypes, sidebarReviewSections } from "./reviewTypes";
 import { lineDomId, sectionDomId, readUrlSelection, replaceUrlSelection, clearSectionHash, currentSectionHashId, scrollToSectionHash, overlayIdForPackage } from "./routing";
@@ -14,13 +14,14 @@ import { buildCollectedItemRows, buildProjectRecordingCards, buildProjectRows, b
 import { ActionButton, Popover } from "./components/common";
 import { ProcessHelpModal } from "./components/panels";
 import { ReviewWorkspace } from "./components/reviewWorkspace";
-import { AllMemosWorkspace, CollectedItemsWorkspace, ProjectsWorkspace } from "./components/workspaces";
+import { AllMemosWorkspace, CollectedItemsWorkspace, NextTopicsWorkspace, ProjectsWorkspace } from "./components/workspaces";
 import "./styles.css";
 
 function App() {
   let audioRef: HTMLAudioElement | undefined;
   const initialUrlSelection = readUrlSelection();
   const [allPackages, setAllPackages] = createSignal<MemoPackage[]>([]);
+  const [nextTopics, setNextTopics] = createSignal<NextTopicsArtifact | undefined>();
   const [selectedPackageName, setSelectedPackageName] = createSignal(initialUrlSelection.transcript ?? "");
   const [selectedOverlayId, setSelectedOverlayId] = createSignal(initialUrlSelection.snippet ?? "");
   const [workspaceView, setWorkspaceView] = createSignal<WorkspaceView>(initialUrlSelection.view ?? "review");
@@ -37,6 +38,7 @@ function App() {
   const [isLoading, setIsLoading] = createSignal(true);
   const [isRefreshingLibrary, setIsRefreshingLibrary] = createSignal(false);
   const [isRunningRemainingLlm, setIsRunningRemainingLlm] = createSignal(false);
+  const [isGeneratingNextTopics, setIsGeneratingNextTopics] = createSignal(false);
   const [processingPackageName, setProcessingPackageName] = createSignal("");
   const [rerunningQuestionsPackageName, setRerunningQuestionsPackageName] = createSignal("");
   const [freshPackageName, setFreshPackageName] = createSignal("");
@@ -198,6 +200,7 @@ function App() {
   ) {
     const previousNames = new Set(packages().map((pkg) => pkg.name));
     setAllPackages(library.packages);
+    setNextTopics(library.nextTopics);
     const preferredPackageName = options.preferredPackageName ?? selectedPackageName();
     const visiblePackages = library.packages.filter((pkg) => !hiddenMemoNames().has(pkg.name));
     const nextPackageName = visiblePackages.some((pkg) => pkg.name === preferredPackageName)
@@ -387,6 +390,56 @@ function App() {
       setLoadError(error instanceof Error ? error.message : "LLM processing failed.");
     } finally {
       setProcessingPackageName("");
+    }
+  }
+
+  async function regenerateNextTopics() {
+    if (isGeneratingNextTopics()) return;
+    try {
+      setLoadError("");
+      setIsGeneratingNextTopics(true);
+      const response = await fetch("/api/voice-memos/next-topics", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({
+          packageNames: packages()
+            .filter((memoPackage) => memoPackage.transcriptSummary?.summary)
+            .map((memoPackage) => memoPackage.name),
+          projects: projects().map((project) => ({
+            name: project.name,
+            description: project.description ?? "",
+            recordingNames: project.recordingNames.filter((packageName) =>
+              packages().some((memoPackage) => memoPackage.name === packageName),
+            ),
+            sectionRefs: project.sectionRefs
+              .filter((section) => packages().some((memoPackage) => memoPackage.name === section.packageName))
+              .map((section) => ({
+                packageName: section.packageName,
+                title: section.title,
+              })),
+          })),
+        }),
+      });
+      const payload = await response.json().catch(() => ({}));
+      if (!response.ok) {
+        throw new Error(payload.error || `Next topic generation failed: ${response.status}`);
+      }
+      if (payload.library) {
+        applyVoiceMemoLibrary(payload.library, {
+          preferredPackageName: selectedPackageName(),
+          preferredOverlayId: selectedOverlayId(),
+        });
+      } else {
+        await loadVoiceMemoLibrary({
+          preferredPackageName: selectedPackageName(),
+          preferredOverlayId: selectedOverlayId(),
+          showLoading: false,
+        });
+      }
+    } catch (error) {
+      setLoadError(error instanceof Error ? error.message : "Next topic generation failed.");
+    } finally {
+      setIsGeneratingNextTopics(false);
     }
   }
 
@@ -643,6 +696,13 @@ function App() {
             Items
           </button>
           <button
+            classList={{ selected: workspaceView() === "topics" }}
+            type="button"
+            onClick={() => setWorkspaceView("topics")}
+          >
+            Topics
+          </button>
+          <button
             classList={{ selected: workspaceView() === "memos" }}
             type="button"
             onClick={() => setWorkspaceView("memos")}
@@ -735,20 +795,31 @@ function App() {
             <Show
               when={workspaceView() === "items"}
               fallback={
-                <AllMemosWorkspace
-                  packages={allPackages()}
-                  hiddenMemoNames={hiddenMemoNames()}
-                  visibleCount={packages().length}
-                  hiddenCount={hiddenMemoCount()}
-                  onHide={hidePackage}
-                  onRestore={restorePackage}
-                  onOpen={restoreAndOpenPackage}
-                />
+                <Show
+                  when={workspaceView() === "topics"}
+                  fallback={
+                    <AllMemosWorkspace
+                      packages={allPackages()}
+                      hiddenMemoNames={hiddenMemoNames()}
+                      visibleCount={packages().length}
+                      hiddenCount={hiddenMemoCount()}
+                      onHide={hidePackage}
+                      onRestore={restorePackage}
+                      onOpen={restoreAndOpenPackage}
+                    />
+                  }
+                >
+                  <NextTopicsWorkspace
+                    artifact={nextTopics()}
+                    packageCount={packages().filter((memoPackage) => memoPackage.transcriptSummary?.summary).length}
+                    isGenerating={isGeneratingNextTopics()}
+                    onRegenerate={() => void regenerateNextTopics()}
+                  />
+                </Show>
               }
             >
               <CollectedItemsWorkspace
                 rows={filteredCollectedItems()}
-                totalCount={collectedItems().length}
                 filter={collectedTypeFilter()}
                 typeCounts={collectedTypeCounts()}
                 onFilter={setCollectedTypeFilter}
