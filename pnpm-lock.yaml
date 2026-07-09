@@ -6,4 +6,35 @@ settings:
 
 importers:
 
-  .: {}
+  .:
+    dependencies:
+      dotenv:
+        specifier: ^16.4.7
+        version: 16.6.1
+      openai:
+        specifier: ^5.0.0
+        version: 5.23.2
+
+packages:
+
+  dotenv@16.6.1:
+    resolution: {integrity: sha512-uBq4egWHTcTt33a72vpSG0z3HnPuIl6NqYcTrKEg2azoEyl2hpW0zqlxysq2pK9HlDIHyHyakeYaYnSAwd8bow==}
+    engines: {node: '>=12'}
+
+  openai@5.23.2:
+    resolution: {integrity: sha512-MQBzmTulj+MM5O8SKEk/gL8a7s5mktS9zUtAkU257WjvobGc9nKcBuVwjyEEcb9SI8a8Y2G/mzn3vm9n1Jlleg==}
+    hasBin: true
+    peerDependencies:
+      ws: ^8.18.0
+      zod: ^3.23.8
+    peerDependenciesMeta:
+      ws:
+        optional: true
+      zod:
+        optional: true
+
+snapshots:
+
+  dotenv@16.6.1: {}
+
+  openai@5.23.2: {}

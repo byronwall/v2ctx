@@ -2,15 +2,15 @@ import { Show, createEffect, createMemo, createResource, createSignal, onCleanup
 import { render } from "solid-js/web";
 import { fileUrl } from "./packageLoader";
 import type { MemoPackage, VoiceMemoLibrary } from "./types";
-import type { CollectedItemRow, ProjectRecord, ProjectRecordingCard, ProjectSectionRef, TranscriptOverlay, TranscriptSection, WorkspaceView, PackageSortMode, OverlayType, CollectedItemType, ProjectCardCountType } from "./reviewTypes";
+import type { CollectedItemRow, ProjectRecord, ProjectRecordingCard, TranscriptOverlay, TranscriptSection, WorkspaceView, OverlayType, CollectedItemType, ProjectCardCountType } from "./reviewTypes";
 import { defaultProjectCardCountTypes, sidebarReviewSections } from "./reviewTypes";
 import { lineDomId, sectionDomId, readUrlSelection, replaceUrlSelection, clearSectionHash, currentSectionHashId, scrollToSectionHash, overlayIdForPackage } from "./routing";
 import { fetchVoiceMemoLibrary } from "./library";
-import { comparePackages, firstReadablePackage, packageDisplayTitle } from "./packageModel";
+import { firstReadablePackage } from "./packageModel";
 import { packageDate } from "./datetime";
 import { buildOverlays, buildSections, normalizeTranscriptLines, sourceStartMs } from "./transcriptModel";
 import { buildProjectMarkdown } from "./markdown";
-import { buildCollectedItemRows, buildProjectRows, buildUnassignedRecordingCards, countCollectedItemTypes, followUpQuestionsForPackage, loadStoredHiddenMemoNames, loadStoredProjects, projectColor, projectsForPackage, saveStoredHiddenMemoNames, saveStoredProjects, toggleProjectCardCountType, touchProject } from "./projectModel";
+import { buildCollectedItemRows, buildProjectRecordingCards, buildProjectRows, buildUnassignedRecordingCards, countCollectedItemTypes, followUpQuestionsForPackage, loadStoredHiddenMemoNames, loadStoredProjects, projectColor, projectsForPackage, saveStoredHiddenMemoNames, saveStoredProjects, toggleProjectCardCountType, touchProject } from "./projectModel";
 import { ActionButton, Popover } from "./components/common";
 import { ProcessHelpModal } from "./components/panels";
 import { ReviewWorkspace } from "./components/reviewWorkspace";
@@ -24,8 +24,6 @@ function App() {
   const [selectedPackageName, setSelectedPackageName] = createSignal(initialUrlSelection.transcript ?? "");
   const [selectedOverlayId, setSelectedOverlayId] = createSignal(initialUrlSelection.snippet ?? "");
   const [workspaceView, setWorkspaceView] = createSignal<WorkspaceView>(initialUrlSelection.view ?? "review");
-  const [packageSearch, setPackageSearch] = createSignal("");
-  const [packageSortMode, setPackageSortMode] = createSignal<PackageSortMode>("updated");
   const [overlayFilter, setOverlayFilter] = createSignal<OverlayType | "all">("all");
   const [projectSearch, setProjectSearch] = createSignal("");
   const [collectedTypeFilter, setCollectedTypeFilter] = createSignal<CollectedItemType | "all">("all");
@@ -113,22 +111,6 @@ function App() {
     setIsLoading(false);
   });
 
-  const packageCards = createMemo(() => {
-    const term = packageSearch().trim().toLowerCase();
-    return [...packages()]
-      .sort((a, b) => comparePackages(a, b, packageSortMode()))
-      .filter((pkg) => {
-        if (!term) return true;
-        const haystack = `${pkg.name} ${packageDisplayTitle(pkg)} ${pkg.status} ${pkg.transcriptSummary?.summary ?? ""} ${pkg.transcriptSummary?.topBullets.join(" ") ?? ""} ${pkg.segments.map((s) => s.title ?? s.gist ?? "").join(" ")}`;
-        return haystack.toLowerCase().includes(term);
-      });
-  });
-  const packageSortLabel = createMemo(() =>
-    packageSortMode() === "updated"
-      ? "Sorted by recently updated. Click to sort by needs process."
-      : "Sorted by needs process. Click to sort by recently updated.",
-  );
-
   const selectedPackage = createMemo(() => {
     return packages().find((pkg) => pkg.name === selectedPackageName()) ?? packages()[0];
   });
@@ -188,6 +170,13 @@ function App() {
   });
   const unassignedRecordings = createMemo(() => buildUnassignedRecordingCards(projects(), packages()));
   const selectedPackageProjects = createMemo(() => projectsForPackage(projects(), selectedPackageName()));
+  const activeProject = createMemo(() => selectedPackageProjects()[0]);
+  const activeProjectRecordings = createMemo(() => {
+    const project = activeProject();
+    const packageName = selectedPackageName();
+    if (!project) return [];
+    return buildProjectRecordingCards(project, packages()).filter((recording) => recording.packageName !== packageName);
+  });
   const collectedItems = createMemo(() => buildCollectedItemRows(packages()));
   const collectedTypeCounts = createMemo(() => countCollectedItemTypes(collectedItems()));
   const filteredCollectedItems = createMemo(() => {
@@ -195,20 +184,6 @@ function App() {
     const rows = collectedItems();
     return filter === "all" ? rows : rows.filter((item) => item.type === filter);
   });
-  const selectedSectionProjectIds = createMemo(() => {
-    const map = new Map<string, Set<string>>();
-    const packageName = selectedPackageName();
-    for (const project of projects()) {
-      for (const ref of project.sectionRefs) {
-        if (ref.packageName !== packageName) continue;
-        const projectIds = map.get(ref.sectionId) ?? new Set<string>();
-        projectIds.add(project.id);
-        map.set(ref.sectionId, projectIds);
-      }
-    }
-    return map;
-  });
-
   createEffect(() => {
     saveStoredProjects(projects());
   });
@@ -545,47 +520,10 @@ function App() {
     return project.id;
   }
 
-  function assignSelectedPackageToProject(projectId: string) {
-    const packageName = selectedPackage()?.name;
-    if (!packageName) return;
-    assignPackageNameToProject(packageName, projectId);
-  }
-
-  function assignPackageNameToProject(packageName: string, projectId: string) {
-    setProjects((current) =>
-      current.map((project) =>
-        project.id === projectId
-          ? touchProject({
-              ...project,
-              recordingNames: project.recordingNames.includes(packageName)
-                ? project.recordingNames
-                : [...project.recordingNames, packageName],
-            })
-          : project,
-      ),
-    );
-  }
-
   function moveRecordingCardToProject(recording: ProjectRecordingCard, projectId: string) {
-    const now = new Date().toISOString();
+    if (recording.kind === "section") return;
     setProjects((current) =>
       current.map((project) => {
-        if (recording.kind === "section" && recording.sectionId) {
-          const sectionRefs = project.sectionRefs.filter(
-            (ref) => ref.packageName !== recording.packageName || ref.sectionId !== recording.sectionId,
-          );
-          if (project.id !== projectId) return sectionRefs.length === project.sectionRefs.length ? project : { ...project, sectionRefs };
-          const nextRef: ProjectSectionRef = {
-            packageName: recording.packageName,
-            sectionId: recording.sectionId,
-            title: recording.title,
-            startMs: recording.startMs,
-            endMs: recording.endMs ?? recording.startMs,
-            assignedAt: now,
-          };
-          return touchProject({ ...project, sectionRefs: [...sectionRefs, nextRef] });
-        }
-
         const recordingNames = project.recordingNames.filter((name) => name !== recording.packageName);
         if (project.id !== projectId) return recordingNames.length === project.recordingNames.length ? project : { ...project, recordingNames };
         return touchProject({ ...project, recordingNames: [...recordingNames, recording.packageName] });
@@ -601,68 +539,8 @@ function App() {
     );
   }
 
-  function removeSelectedPackageFromProject(projectId: string) {
-    const packageName = selectedPackage()?.name;
-    if (!packageName) return;
-    setProjects((current) =>
-      current.map((project) =>
-        project.id === projectId
-          ? touchProject({
-              ...project,
-              recordingNames: project.recordingNames.filter((name) => name !== packageName),
-            })
-          : project,
-      ),
-    );
-  }
-
-  function assignSectionToProject(section: TranscriptSection, projectId: string) {
-    const packageName = selectedPackage()?.name;
-    if (!packageName) return;
-    const ref: ProjectSectionRef = {
-      packageName,
-      sectionId: section.id,
-      title: section.title,
-      startMs: section.startMs,
-      endMs: section.endMs,
-      assignedAt: new Date().toISOString(),
-    };
-    setProjects((current) =>
-      current.map((project) => {
-        if (project.id !== projectId) return project;
-        const alreadyAssigned = project.sectionRefs.some(
-          (item) => item.packageName === ref.packageName && item.sectionId === ref.sectionId,
-        );
-        return alreadyAssigned ? project : touchProject({ ...project, sectionRefs: [...project.sectionRefs, ref] });
-      }),
-    );
-  }
-
-  function removeSectionFromProject(section: TranscriptSection, projectId: string) {
-    const packageName = selectedPackage()?.name;
-    if (!packageName) return;
-    setProjects((current) =>
-      current.map((project) =>
-        project.id === projectId
-          ? touchProject({
-              ...project,
-              sectionRefs: project.sectionRefs.filter(
-                (item) => item.packageName !== packageName || item.sectionId !== section.id,
-              ),
-            })
-          : project,
-      ),
-    );
-  }
-
   function deleteProject(projectId: string) {
     setProjects((current) => current.filter((project) => project.id !== projectId));
-  }
-
-  function assignSectionFromSelect(section: TranscriptSection, value: string) {
-    if (!value) return;
-    const projectId = value === "__new__" ? createProject() : value;
-    if (projectId) assignSectionToProject(section, projectId);
   }
 
   function openProjectRecording(recording: ProjectRecordingCard) {
@@ -822,17 +700,9 @@ function App() {
         fallback={
       <ReviewWorkspace
         isLoading={isLoading}
-        packages={packages}
-        packageSortLabel={packageSortLabel}
-        packageSortMode={packageSortMode}
-        setPackageSortMode={setPackageSortMode}
-        packageSearch={packageSearch}
-        setPackageSearch={setPackageSearch}
         initialLibrary={initialLibrary}
-        packageCards={packageCards}
         selectedPackage={selectedPackage}
         freshPackageName={freshPackageName}
-        selectPackage={selectPackage}
         transcriptLines={transcriptLines}
         processingPackageName={processingPackageName}
         isRunningRemainingLlm={isRunningRemainingLlm}
@@ -844,20 +714,15 @@ function App() {
         setOverlayFilter={setOverlayFilter}
         sections={sections}
         linkToSection={linkToSection}
-        selectedSectionProjectIds={selectedSectionProjectIds}
-        projects={projects}
-        assignSectionFromSelect={assignSectionFromSelect}
-        removeSectionFromProject={removeSectionFromProject}
+        activeProject={activeProject}
+        activeProjectRecordings={activeProjectRecordings}
+        openProjectRecording={openProjectRecording}
         jumpTo={jumpTo}
         overlays={overlays}
         selectedOverlay={selectedOverlay}
         selectOverlay={selectOverlay}
         audioUrl={audioUrl}
         setAudioRef={(element) => { audioRef = element; }}
-        createProject={createProject}
-        assignSelectedPackageToProject={assignSelectedPackageToProject}
-        selectedPackageProjects={selectedPackageProjects}
-        removeSelectedPackageFromProject={removeSelectedPackageFromProject}
         selectedPackageQuestions={selectedPackageQuestions}
         sidebarReviewGroups={sidebarReviewGroups}
         unmatchedItems={unmatchedItems}

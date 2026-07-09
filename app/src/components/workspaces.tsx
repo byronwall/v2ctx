@@ -290,7 +290,7 @@ export function ProjectsWorkspace(props: {
           each={props.rows}
           fallback={
             <div class="projects-empty">
-              <p>No projects yet. Create a project, then assign a whole recording or specific transcript section.</p>
+              <p>No projects yet. Create a project, then assign recordings.</p>
               <button class="primary-action" type="button" onClick={() => props.onCreateProject()}>
                 + New Project
               </button>
@@ -433,7 +433,7 @@ export function ProjectRecordingCardShell(props: {
         onPointerDown={props.onPointerDown}
         onPointerUp={props.onPointerUp}
       />
-      <Show when={props.projects.length}>
+      <Show when={props.projects.length && props.recording.kind === "recording"}>
         <MoveRecordingMenu projects={props.projects} onMove={props.onMove} />
       </Show>
     </span>

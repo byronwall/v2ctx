@@ -100,7 +100,7 @@ export function buildProjectRows(projects: ProjectRecord[], packages: MemoPackag
         summaries[0] ??
         (recordings.length
           ? `This project includes ${recordings.length} assigned recording${recordings.length === 1 ? "" : "s"} sorted by source time.`
-          : "No recordings or sections have been assigned yet."),
+          : "No recordings have been assigned yet."),
       insights,
       durationMs: recordings.reduce((total, recording) => total + (recording.durationMs ?? 0), 0),
     };
@@ -139,35 +139,7 @@ export function buildProjectRecordingCards(project: ProjectRecord, packages: Mem
     ];
   });
 
-  const sectionCards = project.sectionRefs.flatMap((ref): ProjectRecordingCard[] => {
-    const memoPackage = byName.get(ref.packageName);
-    if (!memoPackage) return [];
-    const sections = buildSections(memoPackage, normalizeTranscriptLines(memoPackage));
-    const section = sections.find((item) => item.id === ref.sectionId);
-    return [
-      {
-        id: `${project.id}::section::${ref.packageName}::${ref.sectionId}`,
-        projectId: project.id,
-        kind: "section",
-        packageName: ref.packageName,
-        title: ref.title,
-        dateMs: packageDate(ref.packageName),
-        startMs: ref.startMs,
-        endMs: ref.endMs,
-        durationMs: Math.max(0, ref.endMs - ref.startMs),
-        sectionId: ref.sectionId,
-        summary: section?.summary,
-        counts: projectCardCounts(memoPackage, ref.sectionId),
-        sectionCount: 1,
-        topSections: [{ title: packageDisplayTitle(memoPackage), time: formatTime(ref.startMs) }],
-        audioUrl: fileUrl(memoPackage.audio),
-        audioSize: memoPackage.audio?.size,
-        audioMtimeMs: memoPackage.audio?.mtimeMs,
-      },
-    ];
-  });
-
-  return [...wholeRecordingCards, ...sectionCards].sort(
+  return wholeRecordingCards.sort(
     (a, b) => a.dateMs - b.dateMs || a.startMs - b.startMs || a.title.localeCompare(b.title),
   );
 }

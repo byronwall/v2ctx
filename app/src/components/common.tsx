@@ -60,6 +60,70 @@ export function ExportMarkdownActions(props: {
   );
 }
 
+export function MarkdownExportMenu(props: {
+  label: string;
+  markdown: () => string;
+  filename: () => string;
+}) {
+  const [copyStatus, setCopyStatus] = createSignal<"idle" | "copied" | "failed">("idle");
+  let resetTimer: number | undefined;
+  const hasMarkdown = () => !!props.markdown().trim();
+
+  onCleanup(() => {
+    if (resetTimer) window.clearTimeout(resetTimer);
+  });
+
+  const resetStatusSoon = () => {
+    if (resetTimer) window.clearTimeout(resetTimer);
+    resetTimer = window.setTimeout(() => setCopyStatus("idle"), 1600);
+  };
+
+  const copyLabel = () => {
+    if (copyStatus() === "copied") return "Copied";
+    if (copyStatus() === "failed") return "Copy failed";
+    return "Copy Markdown";
+  };
+
+  return (
+    <Popover
+      class="markdown-export-menu"
+      panelClass="markdown-export-popover"
+      triggerLabel={`Export ${props.label}`}
+      trigger={<span class="kebab-icon" aria-hidden="true"></span>}
+      content={({ close }) => (
+        <>
+          <ActionButton
+            variant="menu"
+            disabled={!hasMarkdown()}
+            onClick={async () => {
+              const markdown = props.markdown().trim();
+              if (!markdown) return;
+              const copied = await copyMarkdown(markdown);
+              setCopyStatus(copied ? "copied" : "failed");
+              resetStatusSoon();
+              if (copied) close();
+            }}
+          >
+            {copyLabel()}
+          </ActionButton>
+          <ActionButton
+            variant="menu"
+            disabled={!hasMarkdown()}
+            onClick={() => {
+              const markdown = props.markdown().trim();
+              if (!markdown) return;
+              downloadMarkdownFile(props.filename(), markdown);
+              close();
+            }}
+          >
+            Download .md
+          </ActionButton>
+        </>
+      )}
+    />
+  );
+}
+
 export function ProjectExportMenu(props: {
   markdown: () => string;
   filename: () => string;

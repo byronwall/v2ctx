@@ -40,30 +40,12 @@ export function buildProjectMarkdown(project: ProjectRecord, packages: MemoPacka
     if (!pkg) return [];
     return [`## ${packageDisplayTitle(pkg)}\n\n${buildPackageMarkdown(pkg).replace(/^# .+\n+/, "")}`];
   });
-  const assignedSections = project.sectionRefs.flatMap((ref) => {
-    const pkg = byName.get(ref.packageName);
-    if (!pkg) return [];
-    const section = buildSections(pkg, normalizeTranscriptLines(pkg)).find((item) => item.id === ref.sectionId);
-    if (!section) return [];
-    return [
-      [
-        `## ${section.title}`,
-        `Source package: ${pkg.name}`,
-        `Time: ${formatTime(section.startMs)} - ${formatTime(section.endMs)}`,
-        section.summary ? `\n### Summary\n\n${section.summary}` : "",
-        "\n### Transcript",
-        transcriptTextMarkdown(section),
-      ].join("\n\n"),
-    ];
-  });
   const parts = [
     `# ${project.name}`,
     "Project transcript export",
     project.description ? `Description: ${project.description}` : "",
     project.recordingNames.length ? "\n## Whole Recording Transcripts" : "",
     recordingSections.join("\n\n"),
-    project.sectionRefs.length ? "\n## Assigned Section Transcripts" : "",
-    assignedSections.join("\n\n"),
   ];
   return compactMarkdown(parts);
 }
