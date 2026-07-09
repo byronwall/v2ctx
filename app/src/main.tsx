@@ -15,6 +15,7 @@ import { ActionButton, Popover } from "./components/common";
 import { ProcessHelpModal } from "./components/panels";
 import { ReviewWorkspace } from "./components/reviewWorkspace";
 import { AllMemosWorkspace, CollectedItemsWorkspace, NextTopicsWorkspace, ProjectsWorkspace } from "./components/workspaces";
+import { WaveformIcon } from "./components/WaveformIcon";
 import "./styles.css";
 
 function App() {
@@ -671,6 +672,7 @@ function App() {
     <main class="shell">
       <header class="masthead">
         <div class="masthead-copy">
+          <WaveformIcon class="app-mark" />
           <h1>Voice memo review</h1>
         </div>
         <div class="view-switch" aria-label="Workspace view">

@@ -49,9 +49,19 @@ p {
 }
 
 .masthead-copy {
+  display: flex;
+  align-items: center;
+  gap: 9px;
   min-width: 0;
   max-width: 620px;
   justify-self: start;
+}
+
+.app-mark {
+  width: 28px;
+  height: 28px;
+  flex: 0 0 auto;
+  color: #2563eb;
 }
 
 .eyebrow {
