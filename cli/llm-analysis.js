@@ -1,6 +1,7 @@
 import fs from "node:fs/promises";
 import path from "node:path";
 import os from "node:os";
+import crypto from "node:crypto";
 import { fileURLToPath } from "node:url";
 import OpenAI from "openai";
 import dotenv from "dotenv";
@@ -10,6 +11,7 @@ const MODULE_DIR = path.dirname(fileURLToPath(import.meta.url));
 const REPO_ROOT = path.resolve(MODULE_DIR, "..");
 
 export const LLM_PROMPT_VERSION = "transcript-llm-analysis@2026-07-03.1";
+export const FOLLOW_UP_QUESTIONS_PROMPT_VERSION = "transcript-follow-up-questions@2026-07-08.1";
 export const DEFAULT_LLM_PROVIDER = "openai";
 export const DEFAULT_LLM_MODEL = "gpt-5.4-mini";
 
@@ -22,7 +24,6 @@ const ITEM_FIELDS = [
   "tweetCandidates",
   "quoteCandidates",
   "voiceMarkers",
-  "followUpQuestions",
   "sensitiveFlags",
 ];
 
@@ -32,6 +33,18 @@ const PRICE_SOURCE = {
   retrievedAt: "2026-07-03",
   unit: "usd_per_1m_tokens",
 };
+
+const SHARED_TRANSCRIPT_INSTRUCTIONS = [
+  "You analyze a full timestamped voice memo transcript.",
+  "Treat the transcript message as the stable shared context for all tasks in this run.",
+  "Ground every answer in that transcript and preserve timestamp/source references when requested.",
+  "Do not invent facts, examples, tasks, opinions, project names, or certainty.",
+].join("\n");
+
+const TRANSCRIPT_PLAN_SCHEMA_NAME = "transcript_plan";
+const TRANSCRIPT_EXTRACTION_SCHEMA_NAME = "transcript_extraction";
+const FOLLOW_UP_QUESTIONS_SCHEMA_NAME = "follow_up_questions";
+const DEFAULT_LLM_EXTRACTION_CONCURRENCY = 3;
 
 const OPENAI_STANDARD_PRICES = {
   "gpt-5.5": {
@@ -85,28 +98,55 @@ export async function runLlmAnalysis(packageDir, opts = {}) {
     info("loading OpenAI client and .env");
     const client = opts.openAIClient || createOpenAIClient(root);
     info("OpenAI client ready");
+    const promptCacheKey = promptCacheKeyForTranscript(model, transcript);
+    info(`prompt cache key=${promptCacheKey}`);
+    const extractionConcurrency = llmExtractionConcurrency(opts);
     const llmUsage = createUsageAccumulator(provider, model);
 
     info("semantic sectioning start");
-    const planCall = await planTranscript(client, { model, root, transcript });
+    const planCall = await planTranscript(client, { model, root, transcript, promptCacheKey });
     const summary = planCall.data;
     addUsage(llmUsage, planCall);
     const semanticSegments = normalizePlannedSegments(summary.sections || [], transcript, sourceSegments);
     info(`semantic sectioning done: ${semanticSegments.length} section(s) ${formatCallUsage(planCall)}`);
 
     const record = emptyTranscriptRecord(transcript, sourceSegments);
-    for (const field of ITEM_FIELDS) {
+    const runExtraction = async (field) => {
       info(`extract ${field} start`);
       const extractionCall = await extractTranscriptItems(client, {
         model,
         field,
         transcript,
         segments: semanticSegments,
+        promptCacheKey,
       });
       addUsage(llmUsage, extractionCall);
       record[field] = normalizeItems(extractionCall.data.items || [], transcript, semanticSegments);
       info(`extract ${field} done: ${record[field].length} item(s) ${formatCallUsage(extractionCall)}`);
+    };
+
+    const [cacheWarmupField, ...parallelFields] = ITEM_FIELDS;
+    if (cacheWarmupField) {
+      await runExtraction(cacheWarmupField);
     }
+    if (parallelFields.length) {
+      info(`extract remaining start: ${parallelFields.length} field(s), concurrency=${extractionConcurrency}`);
+      await mapWithConcurrency(parallelFields, extractionConcurrency, runExtraction);
+    }
+    info("follow-up questions start");
+    const followUpCall = await generateFollowUpQuestions(client, {
+      model,
+      transcript,
+      segments: semanticSegments,
+      promptCacheKey,
+    });
+    addUsage(llmUsage, followUpCall);
+    const followUpQuestions = normalizeFollowUpQuestions(
+      followUpCall.data.questions || [],
+      transcript,
+      semanticSegments,
+    );
+    info(`follow-up questions done: ${followUpQuestions.length} question(s) ${formatCallUsage(followUpCall)}`);
     validateExtractionRecord(record);
     const records = [record];
     info(`LLM total: ${formatUsageSummary(llmUsage.totals)} ${formatCost(llmUsage.totalCost)}`);
@@ -128,6 +168,29 @@ export async function runLlmAnalysis(packageDir, opts = {}) {
     const segmentAnalysisPath = path.join(analysisDir, "segment-analysis.jsonl");
     info(`writing ${path.relative(root, segmentAnalysisPath)}`);
     await writeJsonl(segmentAnalysisPath, records);
+
+    const followUpQuestionsPath = path.join(analysisDir, "follow-up-questions.json");
+    info(`writing ${path.relative(root, followUpQuestionsPath)}`);
+    await fs.writeFile(
+      followUpQuestionsPath,
+      `${JSON.stringify(
+        {
+          promptVersion: FOLLOW_UP_QUESTIONS_PROMPT_VERSION,
+          model,
+          provider,
+          generatedAt: startedAt,
+          usage: usageSummaryForJson(llmUsage),
+          source: {
+            transcript: transcript.source,
+            range: { start: transcript.start, end: transcript.end },
+          },
+          questions: followUpQuestions,
+        },
+        null,
+        2,
+      )}\n`,
+      "utf8",
+    );
 
     const transcriptSummaryPath = path.join(analysisDir, "transcript-summary.json");
     info(`writing ${path.relative(root, transcriptSummaryPath)}`);
@@ -158,6 +221,7 @@ export async function runLlmAnalysis(packageDir, opts = {}) {
       model,
       provider,
       segmentAnalysisPath,
+      followUpQuestionsPath,
       transcriptSummaryPath,
       count: records.length,
       usage: usageSummaryForJson(llmUsage),
@@ -186,6 +250,68 @@ export async function runLlmAnalysis(packageDir, opts = {}) {
       `LLM transcript analysis failed. Retry this package with: v2c analyze ${root} --run-llm --derive\n${message}`,
     );
   }
+}
+
+export async function runFollowUpQuestionsAnalysis(packageDir, opts = {}) {
+  const root = path.resolve(expandHome(packageDir));
+  const analysisDir = path.join(root, "analysis");
+  const segmentsPath = path.join(analysisDir, "segments.json");
+  const provider = opts.llmProvider || DEFAULT_LLM_PROVIDER;
+  const model = opts.llmModel || DEFAULT_LLM_MODEL;
+
+  if (provider !== "openai") {
+    throw new Error(`Unsupported LLM provider: ${provider}. Only "openai" is supported.`);
+  }
+
+  const segmentsPayload = await readJson(segmentsPath);
+  const sourceSegments = segmentsPayload?.segments || [];
+  if (!sourceSegments.length) throw new Error(`No transcript sections found for follow-up questions: ${segmentsPath}`);
+  const transcript = await readTranscriptContext(root, sourceSegments);
+  const segments = sourceSegments.map((segment, index) => ({
+    ...plannedSegmentFromSource(segment, index),
+    id: segment.id || `seg_${String(index + 1).padStart(3, "0")}`,
+    text: segment.text || segment.cleanedText || "",
+  }));
+
+  const startedAt = new Date(parseInt(process.env.V2C_NOW || Date.now(), 10)).toISOString();
+  const startedMs = Date.now();
+  step(`LLM follow-up questions: ${path.basename(root)}`);
+  info(`provider=${provider} model=${model} transcriptItems=${transcript.items.length}`);
+  await fs.mkdir(analysisDir, { recursive: true });
+  const client = opts.openAIClient || createOpenAIClient(root);
+  const promptCacheKey = promptCacheKeyForTranscript(model, transcript);
+  const call = await generateFollowUpQuestions(client, { model, transcript, segments, promptCacheKey });
+  const questions = normalizeFollowUpQuestions(call.data.questions || [], transcript, segments);
+  const followUpQuestionsPath = path.join(analysisDir, "follow-up-questions.json");
+  await fs.writeFile(
+    followUpQuestionsPath,
+    `${JSON.stringify(
+      {
+        promptVersion: FOLLOW_UP_QUESTIONS_PROMPT_VERSION,
+        model,
+        provider,
+        generatedAt: startedAt,
+        source: {
+          transcript: transcript.source,
+          range: { start: transcript.start, end: transcript.end },
+        },
+        usage: usageSummaryForJson(usageAccumulatorFromCall(provider, model, call)),
+        questions,
+      },
+      null,
+      2,
+    )}\n`,
+    "utf8",
+  );
+  done(`Follow-up questions complete in ${formatDuration(Date.now() - startedMs)}`);
+  return {
+    root,
+    model,
+    provider,
+    followUpQuestionsPath,
+    count: questions.length,
+    usage: usageSummaryForJson(usageAccumulatorFromCall(provider, model, call)),
+  };
 }
 
 function createOpenAIClient(packageRoot) {
@@ -237,6 +363,29 @@ function formatDuration(ms) {
   return `${Math.floor(seconds / 60)}m ${String(seconds % 60).padStart(2, "0")}s`;
 }
 
+function llmExtractionConcurrency(opts) {
+  const raw = opts.llmExtractionConcurrency ?? process.env.V2C_LLM_EXTRACTION_CONCURRENCY;
+  const parsed = Number.parseInt(raw, 10);
+  if (!Number.isFinite(parsed)) return DEFAULT_LLM_EXTRACTION_CONCURRENCY;
+  return Math.max(1, Math.min(parsed, DEFAULT_LLM_EXTRACTION_CONCURRENCY));
+}
+
+async function mapWithConcurrency(items, concurrency, mapper) {
+  const results = new Array(items.length);
+  let nextIndex = 0;
+  const workerCount = Math.min(Math.max(concurrency, 1), items.length);
+  await Promise.all(
+    Array.from({ length: workerCount }, async () => {
+      while (nextIndex < items.length) {
+        const index = nextIndex;
+        nextIndex += 1;
+        results[index] = await mapper(items[index], index);
+      }
+    }),
+  );
+  return results;
+}
+
 function createUsageAccumulator(provider, model) {
   const pricing = priceForModel(provider, model);
   return {
@@ -248,6 +397,12 @@ function createUsageAccumulator(provider, model) {
     costBreakdown: pricing ? emptyCostBreakdown() : null,
     totals: emptyUsage(),
   };
+}
+
+function usageAccumulatorFromCall(provider, model, call) {
+  const accumulator = createUsageAccumulator(provider, model);
+  addUsage(accumulator, call);
+  return accumulator;
 }
 
 function emptyUsage() {
@@ -417,14 +572,14 @@ function usageSummaryForJson(accumulator) {
   };
 }
 
-async function planTranscript(client, { model, root, transcript }) {
+async function planTranscript(client, { model, root, transcript, promptCacheKey }) {
   return callStructured(client, {
     model,
     name: "transcript_plan",
+    schemaName: TRANSCRIPT_PLAN_SCHEMA_NAME,
     schema: transcriptPlanSchema(),
-    input: [
-      transcriptPrefix(transcript),
-      "",
+    promptCacheKey,
+    input: cachedTranscriptInput(transcript, [
       "Task: determine the semantic sections for this entire voice memo transcript.",
       "Use the full context to choose boundaries by meaning, not by fixed pauses or cue phrases.",
       "Respect source audio files as meaningful outer boundaries: do not create a section that crosses source files unless the transcript itself clearly spans a continued thought across combined files.",
@@ -432,18 +587,18 @@ async function planTranscript(client, { model, root, transcript }) {
       "Each section must include start and end timestamps that exist within the transcript range, a specific title, a short summary, and cleanedText for that section.",
       "",
       `Package: ${root}`,
-    ].join("\n"),
+    ]),
   });
 }
 
-async function extractTranscriptItems(client, { model, field, transcript, segments }) {
+async function extractTranscriptItems(client, { model, field, transcript, segments, promptCacheKey }) {
   return callStructured(client, {
     model,
     name: `extract_${field}`,
+    schemaName: TRANSCRIPT_EXTRACTION_SCHEMA_NAME,
     schema: transcriptExtractionSchema(),
-    input: [
-      transcriptPrefix(transcript),
-      "",
+    promptCacheKey,
+    input: cachedTranscriptInput(transcript, [
       "Semantic sections:",
       JSON.stringify(segments.map(({ id, title, start, end }) => ({ id, title, start, end })), null, 2),
       "",
@@ -454,18 +609,47 @@ async function extractTranscriptItems(client, { model, field, transcript, segmen
       "Use supportingQuotes when the same idea is repeated or strengthened by multiple transcript passages.",
       "Do not invent facts, examples, tasks, opinions, project names, or certainty.",
       "Leave items empty when the transcript does not contain grounded entries for this type.",
-    ].join("\n"),
+    ]),
   });
 }
 
-async function callStructured(client, { model, name, schema, input }) {
+async function generateFollowUpQuestions(client, { model, transcript, segments, promptCacheKey }) {
+  return callStructured(client, {
+    model,
+    name: "follow_up_questions",
+    schemaName: FOLLOW_UP_QUESTIONS_SCHEMA_NAME,
+    schema: followUpQuestionsSchema(),
+    promptCacheKey,
+    input: cachedTranscriptInput(transcript, [
+      "Semantic sections:",
+      JSON.stringify(
+        segments.map(({ id, title, start, end, summary }) => ({ id, title, start, end, summary })),
+        null,
+        2,
+      ),
+      "",
+      "Task: generate follow-up questions for this entire transcript in one pass.",
+      "Write questions the speaker should answer later to clarify ambiguity, resolve contradictions, or explore adjacent space.",
+      "For each question, include the assumed answer that is most supported by the rest of the transcript.",
+      "If the transcript supports multiple contradictory readings, include both sides in alternatives instead of choosing one too confidently.",
+      "Prefer questions that help future project work, writing, product decisions, or technical implementation.",
+      "Assign scope='transcript' for whole-recording questions and scope='section' for questions tied to one semantic section.",
+      "Use sectionId only when scope='section'. The sectionId must match one of the semantic section ids.",
+      "Every question must include a short excerpt copied from the transcript.",
+      "Return no more than 12 total questions, prioritizing the highest leverage gaps.",
+    ]),
+  });
+}
+
+async function callStructured(client, { model, name, schemaName, schema, input, promptCacheKey }) {
   const response = await client.responses.create({
     model,
     input,
+    prompt_cache_key: promptCacheKey,
     text: {
       format: {
         type: "json_schema",
-        name,
+        name: schemaName || name,
         strict: true,
         schema,
       },
@@ -480,6 +664,41 @@ async function callStructured(client, { model, name, schema, input }) {
     cost: estimateCost(usage, priceForModel("openai", model)),
     costBreakdown: estimateCostBreakdown(usage, priceForModel("openai", model)),
   };
+}
+
+function cachedTranscriptInput(transcript, taskLines) {
+  return [
+    {
+      role: "developer",
+      content: SHARED_TRANSCRIPT_INSTRUCTIONS,
+    },
+    {
+      role: "user",
+      content: transcriptPrefix(transcript),
+    },
+    {
+      role: "user",
+      content: taskLines.join("\n"),
+    },
+  ];
+}
+
+function promptCacheKeyForTranscript(model, transcript) {
+  const hash = crypto
+    .createHash("sha256")
+    .update(
+      JSON.stringify({
+        promptVersion: LLM_PROMPT_VERSION,
+        model,
+        source: transcript.source,
+        start: transcript.start,
+        end: transcript.end,
+        body: transcript.body,
+      }),
+    )
+    .digest("hex")
+    .slice(0, 32);
+  return `v2c-transcript-${hash}`;
 }
 
 function extractOutputText(response) {
@@ -524,6 +743,38 @@ function normalizeItems(items, transcript, segments) {
         evidence: evidenceQuality(transcript.text, excerpt),
         supportingQuotes,
         sourceSegments: sourceSegmentsForExcerpt(segments, excerpt),
+      };
+    });
+}
+
+function normalizeFollowUpQuestions(items, transcript, segments) {
+  const segmentIds = new Set(segments.map((segment) => segment.id));
+  return (items || [])
+    .filter((item) => item?.question)
+    .slice(0, 12)
+    .map((item, index) => {
+      const excerpt = String(item.excerpt || "").trim();
+      const sectionId = segmentIds.has(item.sectionId) ? item.sectionId : "";
+      const sourceSegments = sectionId
+        ? segments.filter((segment) => segment.id === sectionId).map(sourceSegmentRef)
+        : sourceSegmentsForExcerpt(segments, excerpt);
+      const primary = sourceSegments[0];
+      return {
+        id: `follow_up_${String(index + 1).padStart(3, "0")}`,
+        scope: item.scope === "section" && sectionId ? "section" : "transcript",
+        sectionId,
+        question: String(item.question || "").trim(),
+        assumedAnswer: String(item.assumedAnswer || "").trim(),
+        alternatives: (item.alternatives || []).map((value) => String(value || "").trim()).filter(Boolean),
+        rationale: String(item.rationale || "").trim(),
+        excerpt,
+        evidence: evidenceQuality(transcript.text, excerpt),
+        sourceSegments,
+        source: {
+          segmentId: primary?.segmentId || sectionId || "transcript",
+          start: primary?.start || transcript.start,
+          end: primary?.end || transcript.end,
+        },
       };
     });
 }
@@ -652,6 +903,41 @@ function transcriptExtractionSchema() {
                 },
               },
             },
+          },
+        },
+      },
+    },
+  };
+}
+
+function followUpQuestionsSchema() {
+  return {
+    type: "object",
+    additionalProperties: false,
+    required: ["questions"],
+    properties: {
+      questions: {
+        type: "array",
+        items: {
+          type: "object",
+          additionalProperties: false,
+          required: [
+            "scope",
+            "sectionId",
+            "question",
+            "assumedAnswer",
+            "alternatives",
+            "rationale",
+            "excerpt",
+          ],
+          properties: {
+            scope: { type: "string", enum: ["transcript", "section"] },
+            sectionId: { type: "string" },
+            question: { type: "string" },
+            assumedAnswer: { type: "string" },
+            alternatives: { type: "array", items: { type: "string" } },
+            rationale: { type: "string" },
+            excerpt: { type: "string" },
           },
         },
       },

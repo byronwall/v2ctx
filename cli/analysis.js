@@ -2,7 +2,12 @@ import fs from "node:fs/promises";
 import path from "node:path";
 import os from "node:os";
 import { fmtTime, info, step, done, warn } from "./util.js";
-import { DEFAULT_LLM_MODEL, DEFAULT_LLM_PROVIDER, runLlmAnalysis } from "./llm-analysis.js";
+import {
+  DEFAULT_LLM_MODEL,
+  DEFAULT_LLM_PROVIDER,
+  runFollowUpQuestionsAnalysis,
+  runLlmAnalysis,
+} from "./llm-analysis.js";
 
 const SEGMENT_SCHEMA_VERSION = 1;
 
@@ -136,6 +141,7 @@ export async function getPackageStatus(packageDir) {
     segmentAnalysis: path.join(analysisDir, "segment-analysis.jsonl"),
     reviewInbox: path.join(analysisDir, "review-inbox.jsonl"),
     transcriptSummary: path.join(analysisDir, "transcript-summary.json"),
+    followUpQuestions: path.join(analysisDir, "follow-up-questions.json"),
     llmError: path.join(analysisDir, "llm-error.json"),
   };
   const exists = {};
@@ -187,7 +193,7 @@ export async function continueAnalysisPackage(packageDir, opts = {}) {
       ranLlm = true;
       status = await getPackageStatus(root);
     }
-  } else if (opts.runLlm && !status.exists.transcriptSummary) {
+  } else if (opts.runLlm && (!status.exists.transcriptSummary || !status.exists.followUpQuestions)) {
     actions.push("run_llm");
     await runLlmAnalysis(root, opts);
     ranLlm = true;
@@ -203,7 +209,7 @@ export async function continueAnalysisPackage(packageDir, opts = {}) {
   return { root, actions, status };
 }
 
-export { DEFAULT_LLM_MODEL, DEFAULT_LLM_PROVIDER, runLlmAnalysis };
+export { DEFAULT_LLM_MODEL, DEFAULT_LLM_PROVIDER, runFollowUpQuestionsAnalysis, runLlmAnalysis };
 
 export async function analyzeVoiceMemoPackages(opts = {}) {
   const root = path.resolve(expandHome(opts.output || defaultVoiceMemoOutput()));

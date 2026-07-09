@@ -110,6 +110,37 @@ export type TranscriptSummary = {
   generatedAt?: string;
 };
 
+export type FollowUpQuestion = {
+  id: string;
+  scope: "transcript" | "section";
+  sectionId?: string;
+  question: string;
+  assumedAnswer: string;
+  alternatives: string[];
+  rationale?: string;
+  excerpt?: string;
+  evidence?: string;
+  sourceSegments?: Array<{
+    segmentId?: string;
+    title?: string;
+    start?: string;
+    end?: string;
+  }>;
+  source?: {
+    segmentId?: string;
+    start?: string;
+    end?: string;
+  };
+};
+
+export type FollowUpQuestionsArtifact = {
+  promptVersion?: string;
+  model?: string;
+  provider?: string;
+  generatedAt?: string;
+  questions: FollowUpQuestion[];
+};
+
 export type MemoPackage = {
   name: string;
   title: string;
@@ -118,6 +149,7 @@ export type MemoPackage = {
   reviewItems: ReviewItem[];
   segments: Segment[];
   transcriptSummary?: TranscriptSummary;
+  followUpQuestions?: FollowUpQuestionsArtifact;
   transcript: TranscriptItem[];
   audio?: LoadedFile;
   report?: LoadedFile;

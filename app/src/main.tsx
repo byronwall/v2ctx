@@ -1,13 +1,24 @@
-import { For, Show, Suspense, createEffect, createMemo, createResource, createSignal, onCleanup, onMount } from "solid-js";
-import type { JSX } from "solid-js";
-import { render } from "solid-js/web";
-import { fileUrl, loadPackageFromFileList } from "./packageLoader";
-import type { MemoPackage, PackageStatus, ReviewItem, ReviewType, TranscriptItem, VoiceMemoLibrary } from "./types";
+import { For, Show, Suspense, createEffect, createMemo, createResource, createSignal, onCleanup, onMount, untrack } from "solid-js";
+import type { JSX, Setter } from "solid-js";
+import { Portal, render } from "solid-js/web";
+import { fileUrl } from "./packageLoader";
+import type {
+  FollowUpQuestion,
+  MemoPackage,
+  PackageStatus,
+  ReviewItem,
+  ReviewType,
+  TranscriptItem,
+  VoiceMemoLibrary,
+} from "./types";
 import "./styles.css";
 
 type OverlayType = ReviewType | "claimish";
 type AnchorQuality = "excerpt" | "fuzzy" | "time" | "segment" | "unmatched";
 type PackageSortMode = "updated" | "needs_process";
+type WorkspaceView = "review" | "projects" | "items" | "memos";
+type CollectedItemType = "question" | ReviewType;
+type ProjectCardCountType = "question" | "task" | "idea" | "quote" | "blog_seed" | "sensitive_flag";
 
 type TranscriptLine = TranscriptItem & {
   id: string;
@@ -42,6 +53,7 @@ type TranscriptSection = {
 type UrlSelection = {
   transcript?: string;
   snippet?: string;
+  view?: WorkspaceView;
 };
 
 type LibraryLoadResult = {
@@ -49,8 +61,74 @@ type LibraryLoadResult = {
   error?: string;
 };
 
+type ProjectSectionRef = {
+  packageName: string;
+  sectionId: string;
+  title: string;
+  startMs: number;
+  endMs: number;
+  assignedAt: string;
+};
+
+type ProjectRecord = {
+  id: string;
+  name: string;
+  description?: string;
+  color: string;
+  createdAt: string;
+  updatedAt: string;
+  recordingNames: string[];
+  sectionRefs: ProjectSectionRef[];
+};
+
+type ProjectRecordingCard = {
+  id: string;
+  projectId: string;
+  kind: "recording" | "section";
+  packageName: string;
+  title: string;
+  dateMs: number;
+  startMs: number;
+  endMs?: number;
+  durationMs?: number;
+  sectionId?: string;
+  summary?: string;
+  counts: Record<ProjectCardCountType, number>;
+  sectionCount: number;
+  topSections: { title: string; time: string }[];
+  audioUrl?: string;
+  audioSize?: number;
+  audioMtimeMs?: number;
+};
+
+type ProjectRow = {
+  project: ProjectRecord;
+  recordings: ProjectRecordingCard[];
+  summary: string;
+  insights: string[];
+  durationMs: number;
+};
+
+type CollectedItemRow = {
+  id: string;
+  type: CollectedItemType;
+  packageName: string;
+  packageTitle: string;
+  title: string;
+  content: string;
+  quote: string;
+  source: string;
+  time: string;
+  sortMs: number;
+  reviewItem?: ReviewItem;
+  question?: FollowUpQuestion;
+};
+
 const transcriptQueryParam = "transcript";
 const snippetQueryParam = "snippet";
+const viewQueryParam = "view";
+const projectsStorageKey = "v2ctx.projects.v1";
+const hiddenMemoStorageKey = "v2ctx.hiddenMemos.v1";
 
 const typeLabels: Record<ReviewType, string> = {
   task: "Task",
@@ -61,6 +139,23 @@ const typeLabels: Record<ReviewType, string> = {
   blog_seed: "Blog seed",
   sensitive_flag: "Sensitive",
 };
+
+const collectedTypeLabels: Record<CollectedItemType, string> = {
+  question: "Question",
+  ...typeLabels,
+};
+
+const projectCardCountLabels: Record<ProjectCardCountType, string> = {
+  question: "Questions",
+  task: "Tasks",
+  idea: "Ideas",
+  quote: "Quotes",
+  blog_seed: "Blog seeds",
+  sensitive_flag: "Sensitive",
+};
+
+const projectCardCountOptions: ProjectCardCountType[] = ["question", "task", "idea", "quote", "blog_seed", "sensitive_flag"];
+const defaultProjectCardCountTypes = new Set<ProjectCardCountType>(["question", "task", "idea"]);
 
 const overlayLabels: Record<OverlayType, string> = {
   ...typeLabels,
@@ -76,25 +171,50 @@ const overlayFilters: { value: OverlayType | "all"; label: string }[] = [
   { value: "sensitive_flag", label: "Sensitive" },
 ];
 
+const sidebarReviewSections: { value: OverlayType; label: string }[] = [
+  { value: "task", label: "Tasks" },
+  { value: "claimish", label: "Ideas" },
+  { value: "quote", label: "Quotes" },
+  { value: "blog_seed", label: "Blog seeds" },
+  { value: "sensitive_flag", label: "Sensitive" },
+];
+
 function App() {
   let audioRef: HTMLAudioElement | undefined;
   const initialUrlSelection = readUrlSelection();
-  const [packages, setPackages] = createSignal<MemoPackage[]>([]);
-  const [libraryRoot, setLibraryRoot] = createSignal("");
+  const [allPackages, setAllPackages] = createSignal<MemoPackage[]>([]);
   const [selectedPackageName, setSelectedPackageName] = createSignal(initialUrlSelection.transcript ?? "");
   const [selectedOverlayId, setSelectedOverlayId] = createSignal(initialUrlSelection.snippet ?? "");
+  const [workspaceView, setWorkspaceView] = createSignal<WorkspaceView>(initialUrlSelection.view ?? "review");
   const [packageSearch, setPackageSearch] = createSignal("");
   const [packageSortMode, setPackageSortMode] = createSignal<PackageSortMode>("updated");
   const [overlayFilter, setOverlayFilter] = createSignal<OverlayType | "all">("all");
+  const [projectSearch, setProjectSearch] = createSignal("");
+  const [collectedTypeFilter, setCollectedTypeFilter] = createSignal<CollectedItemType | "all">("all");
+  const [projectCardLimit, setProjectCardLimit] = createSignal<Record<string, number>>({});
+  const [projectCardCountTypes, setProjectCardCountTypes] = createSignal<Set<ProjectCardCountType>>(
+    new Set(defaultProjectCardCountTypes),
+  );
+  const [isProjectComposerOpen, setIsProjectComposerOpen] = createSignal(false);
+  const [newProjectName, setNewProjectName] = createSignal("");
   const [loadError, setLoadError] = createSignal("");
   const [isLoading, setIsLoading] = createSignal(true);
   const [isRefreshingLibrary, setIsRefreshingLibrary] = createSignal(false);
+  const [isRunningRemainingLlm, setIsRunningRemainingLlm] = createSignal(false);
   const [processingPackageName, setProcessingPackageName] = createSignal("");
+  const [rerunningQuestionsPackageName, setRerunningQuestionsPackageName] = createSignal("");
   const [freshPackageName, setFreshPackageName] = createSignal("");
   const [isHelpOpen, setIsHelpOpen] = createSignal(false);
   const [restoredInitialSnippet, setRestoredInitialSnippet] = createSignal(false);
   const [restoredInitialSection, setRestoredInitialSection] = createSignal(false);
+  const [projects, setProjects] = createSignal<ProjectRecord[]>(loadStoredProjects());
+  const [hiddenMemoNames, setHiddenMemoNames] = createSignal<Set<string>>(loadStoredHiddenMemoNames());
   const [initialLibrary] = createResource(fetchVoiceMemoLibrary);
+  const packages = createMemo(() => {
+    const hidden = hiddenMemoNames();
+    return allPackages().filter((pkg) => !hidden.has(pkg.name));
+  });
+  const hiddenMemoCount = createMemo(() => allPackages().filter((pkg) => hiddenMemoNames().has(pkg.name)).length);
 
   onMount(() => {
     let stickyPaneFrame = 0;
@@ -116,6 +236,7 @@ function App() {
       const selection = readUrlSelection();
       setSelectedPackageName(selection.transcript ?? firstReadablePackage(packages())?.name ?? "");
       setSelectedOverlayId(selection.snippet ?? "");
+      setWorkspaceView(selection.view ?? "review");
       setRestoredInitialSnippet(false);
       setRestoredInitialSection(false);
       window.requestAnimationFrame(() => scrollToSectionHash("smooth"));
@@ -146,8 +267,8 @@ function App() {
       setLoadError(result.error);
     } else if (result.library) {
       applyVoiceMemoLibrary(result.library, {
-        preferredPackageName: initialUrlSelection.transcript ?? selectedPackageName(),
-        preferredOverlayId: initialUrlSelection.snippet ?? selectedOverlayId(),
+        preferredPackageName: initialUrlSelection.transcript ?? untrack(selectedPackageName),
+        preferredOverlayId: initialUrlSelection.snippet ?? untrack(selectedOverlayId),
       });
       setLoadError("");
     }
@@ -194,9 +315,9 @@ function App() {
         )
       : [],
   );
+  const selectedPackageOverlayIds = createMemo(() => new Set(overlays().map((overlay) => overlay.id)));
   const selectedOverlay = createMemo(() => {
-    const selected = overlays().find((overlay) => overlay.id === selectedOverlayId());
-    return selected ?? overlays()[0];
+    return overlays().find((overlay) => overlay.id === selectedOverlayId());
   });
   const unmatchedItems = createMemo(() => overlays().filter((overlay) => overlay.quality === "unmatched"));
   const sections = createMemo(() => {
@@ -204,23 +325,81 @@ function App() {
     return pkg ? buildSections(pkg, transcriptLines()) : [];
   });
   const audioUrl = createMemo(() => fileUrl(selectedPackage()?.audio));
+  const selectedPackageQuestions = createMemo(() => followUpQuestionsForPackage(selectedPackage()));
+  const sidebarReviewGroups = createMemo(() =>
+    sidebarReviewSections.map((section) => ({
+      ...section,
+      overlays: overlays().filter((overlay) => overlay.type === section.value),
+    })),
+  );
+  const projectRows = createMemo(() => {
+    const term = projectSearch().trim().toLowerCase();
+    return buildProjectRows(projects(), packages())
+      .filter((row) => {
+        if (!term) return true;
+        const haystack = [
+          row.project.name,
+          row.project.description ?? "",
+          row.summary,
+          row.insights.join(" "),
+          row.recordings.map((recording) => recording.title).join(" "),
+        ].join(" ");
+        return haystack.toLowerCase().includes(term);
+      })
+      .sort((a, b) => Date.parse(b.project.updatedAt) - Date.parse(a.project.updatedAt));
+  });
+  const unassignedRecordings = createMemo(() => buildUnassignedRecordingCards(projects(), packages()));
+  const selectedPackageProjects = createMemo(() => projectsForPackage(projects(), selectedPackageName()));
+  const collectedItems = createMemo(() => buildCollectedItemRows(packages()));
+  const collectedTypeCounts = createMemo(() => countCollectedItemTypes(collectedItems()));
+  const filteredCollectedItems = createMemo(() => {
+    const filter = collectedTypeFilter();
+    const rows = collectedItems();
+    return filter === "all" ? rows : rows.filter((item) => item.type === filter);
+  });
+  const selectedSectionProjectIds = createMemo(() => {
+    const map = new Map<string, Set<string>>();
+    const packageName = selectedPackageName();
+    for (const project of projects()) {
+      for (const ref of project.sectionRefs) {
+        if (ref.packageName !== packageName) continue;
+        const projectIds = map.get(ref.sectionId) ?? new Set<string>();
+        projectIds.add(project.id);
+        map.set(ref.sectionId, projectIds);
+      }
+    }
+    return map;
+  });
+
+  createEffect(() => {
+    saveStoredProjects(projects());
+  });
+
+  createEffect(() => {
+    saveStoredHiddenMemoNames(hiddenMemoNames());
+  });
 
   function applyVoiceMemoLibrary(
     library: VoiceMemoLibrary,
     options: { preferredPackageName?: string; preferredOverlayId?: string; highlightNewPackages?: boolean } = {},
   ) {
     const previousNames = new Set(packages().map((pkg) => pkg.name));
-    setPackages(library.packages);
-    setLibraryRoot(library.root);
+    setAllPackages(library.packages);
     const preferredPackageName = options.preferredPackageName ?? selectedPackageName();
-    const nextPackageName = library.packages.some((pkg) => pkg.name === preferredPackageName)
+    const visiblePackages = library.packages.filter((pkg) => !hiddenMemoNames().has(pkg.name));
+    const nextPackageName = visiblePackages.some((pkg) => pkg.name === preferredPackageName)
       ? preferredPackageName
-      : firstReadablePackage(library.packages)?.name ?? library.packages[0]?.name ?? "";
+      : firstReadablePackage(visiblePackages)?.name ?? visiblePackages[0]?.name ?? "";
     setSelectedPackageName(nextPackageName);
-    setSelectedOverlayId(nextPackageName === preferredPackageName ? options.preferredOverlayId ?? selectedOverlayId() : "");
+    setSelectedOverlayId(
+      nextPackageName === preferredPackageName
+        ? overlayIdForPackage(nextPackageName, options.preferredOverlayId ?? selectedOverlayId(), library.packages)
+        : "",
+    );
 
     if (options.highlightNewPackages) {
       const newestPackage = library.packages
+        .filter((pkg) => !hiddenMemoNames().has(pkg.name))
         .filter((pkg) => !previousNames.has(pkg.name))
         .sort((a, b) => packageDate(b.name) - packageDate(a.name))[0];
       if (newestPackage) {
@@ -241,15 +420,17 @@ function App() {
       if (current) setSelectedOverlayId("");
       return;
     }
-    if (!current || !available.some((overlay) => overlay.id === current)) {
-      setSelectedOverlayId(available[0].id);
+    if (current && !available.some((overlay) => overlay.id === current)) {
+      setSelectedOverlayId("");
     }
   });
 
   createEffect(() => {
     if (isLoading()) return;
     if (!packages().length) return;
-    replaceUrlSelection(selectedPackageName(), selectedOverlayId());
+    const packageName = selectedPackageName();
+    const overlayId = selectedPackageOverlayIds().has(selectedOverlayId()) ? selectedOverlayId() : "";
+    replaceUrlSelection({ transcript: packageName, snippet: overlayId, view: workspaceView() });
   });
 
   createEffect(() => {
@@ -324,17 +505,40 @@ function App() {
     }
   }
 
-  async function handleFiles(files: FileList | null) {
-    if (!files?.length) return;
+  async function runLlmForRemainingPackages() {
+    if (isRunningRemainingLlm() || isRefreshingLibrary() || processingPackageName()) return;
+    const currentPackageName = selectedPackageName();
+    const currentOverlayId = selectedOverlayId();
     try {
       setLoadError("");
-      const loaded = await loadPackageFromFileList(files);
-      setPackages([loaded]);
-      setLibraryRoot("Manual package selection");
-      setSelectedPackageName(loaded.name);
-      setSelectedOverlayId("");
+      setIsRunningRemainingLlm(true);
+      const response = await fetch("/api/voice-memos/run-llm-remaining", {
+        method: "POST",
+      });
+      const payload = await response.json().catch(() => ({}));
+      if (!response.ok) {
+        throw new Error(payload.error || `Remaining LLM processing failed: ${response.status}`);
+      }
+      if (payload.library) {
+        applyVoiceMemoLibrary(payload.library, {
+          preferredPackageName: currentPackageName,
+          preferredOverlayId: currentOverlayId,
+        });
+      } else {
+        await loadVoiceMemoLibrary({
+          preferredPackageName: currentPackageName,
+          preferredOverlayId: currentOverlayId,
+          showLoading: false,
+        });
+      }
+      setFreshPackageName(currentPackageName);
+      window.setTimeout(() => {
+        setFreshPackageName((current) => (current === currentPackageName ? "" : current));
+      }, 1400);
     } catch (error) {
-      setLoadError(error instanceof Error ? error.message : "Could not load package.");
+      setLoadError(error instanceof Error ? error.message : "Remaining LLM processing failed.");
+    } finally {
+      setIsRunningRemainingLlm(false);
     }
   }
 
@@ -352,7 +556,7 @@ function App() {
         throw new Error(payload.error || `LLM processing failed: ${response.status}`);
       }
       if (payload.package) {
-        setPackages((current) =>
+        setAllPackages((current) =>
           current.map((memoPackage) =>
             memoPackage.name === name ? { ...memoPackage, ...payload.package } : memoPackage,
           ),
@@ -373,6 +577,44 @@ function App() {
     }
   }
 
+  async function rerunFollowUpQuestionsForSelectedPackage() {
+    const name = selectedPackage()?.name;
+    if (!name || processingPackageName() || rerunningQuestionsPackageName()) return;
+    try {
+      setLoadError("");
+      setRerunningQuestionsPackageName(name);
+      const response = await fetch(`/api/voice-memos/${encodeURIComponent(name)}/rerun-follow-up-questions`, {
+        method: "POST",
+      });
+      const payload = await response.json().catch(() => ({}));
+      if (!response.ok) {
+        throw new Error(payload.error || `Follow-up question rerun failed: ${response.status}`);
+      }
+      if (payload.package) {
+        setAllPackages((current) =>
+          current.map((memoPackage) =>
+            memoPackage.name === name ? { ...memoPackage, ...payload.package } : memoPackage,
+          ),
+        );
+      } else {
+        await loadVoiceMemoLibrary({
+          preferredPackageName: name,
+          preferredOverlayId: selectedOverlayId(),
+          showLoading: false,
+        });
+      }
+      setSelectedPackageName(name);
+      setFreshPackageName(name);
+      window.setTimeout(() => {
+        setFreshPackageName((current) => (current === name ? "" : current));
+      }, 1400);
+    } catch (error) {
+      setLoadError(error instanceof Error ? error.message : "Follow-up question rerun failed.");
+    } finally {
+      setRerunningQuestionsPackageName("");
+    }
+  }
+
   function jumpTo(ms: number | undefined, lineIndex?: number, play = true) {
     if (lineIndex != null) {
       document.getElementById(lineDomId(lineIndex))?.scrollIntoView({ block: "center", behavior: "smooth" });
@@ -382,9 +624,269 @@ function App() {
     if (play) void audioRef.play().catch(() => {});
   }
 
-  function selectOverlay(overlay: TranscriptOverlay) {
+  function selectOverlay(overlay: TranscriptOverlay, packageName = selectedPackageName()) {
+    if (packageName && selectedPackageName() !== packageName) {
+      setSelectedPackageName(packageName);
+    }
     setSelectedOverlayId(overlay.id);
     jumpTo(sourceStartMs(overlay.item) ?? transcriptLines()[overlay.startLine]?.startMs, overlay.startLine, false);
+  }
+
+  function selectPackage(memoPackage: MemoPackage) {
+    if (hiddenMemoNames().has(memoPackage.name)) return;
+    const isAlreadySelected = selectedPackageName() === memoPackage.name;
+    setSelectedPackageName(memoPackage.name);
+    setSelectedOverlayId("");
+    setRestoredInitialSnippet(true);
+    setRestoredInitialSection(true);
+    clearSectionHash();
+
+    if (!isAlreadySelected) {
+      setFreshPackageName(memoPackage.name);
+      window.setTimeout(() => {
+        setFreshPackageName((current) => (current === memoPackage.name ? "" : current));
+      }, 760);
+    }
+
+    window.requestAnimationFrame(() => {
+      document.querySelector<HTMLElement>(".transcript-pane")?.scrollIntoView({
+        block: "start",
+        behavior: "smooth",
+      });
+    });
+  }
+
+  function hidePackage(packageName: string) {
+    if (!packageName) return;
+    setHiddenMemoNames((current) => new Set([...current, packageName]));
+    setSelectedOverlayId("");
+    const nextPackage = firstReadablePackage(packages().filter((pkg) => pkg.name !== packageName));
+    setSelectedPackageName(nextPackage?.name ?? "");
+    clearSectionHash();
+  }
+
+  function restorePackage(packageName: string) {
+    setHiddenMemoNames((current) => {
+      const next = new Set(current);
+      next.delete(packageName);
+      return next;
+    });
+  }
+
+  function restoreAndOpenPackage(memoPackage: MemoPackage) {
+    restorePackage(memoPackage.name);
+    setWorkspaceView("review");
+    window.requestAnimationFrame(() => selectPackage(memoPackage));
+  }
+
+  function createProject() {
+    setWorkspaceView("projects");
+    setIsProjectComposerOpen(true);
+    window.requestAnimationFrame(() => {
+      document.getElementById("new-project-name")?.focus();
+    });
+    return undefined;
+  }
+
+  function saveNewProject() {
+    const name = newProjectName().trim();
+    if (!name) return undefined;
+    const now = new Date().toISOString();
+    const project: ProjectRecord = {
+      id: `project-${now}-${Math.random().toString(36).slice(2, 8)}`,
+      name,
+      color: projectColor(projects().length),
+      createdAt: now,
+      updatedAt: now,
+      recordingNames: [],
+      sectionRefs: [],
+    };
+    setProjects((current) => [project, ...current]);
+    setNewProjectName("");
+    setIsProjectComposerOpen(false);
+    return project.id;
+  }
+
+  function assignSelectedPackageToProject(projectId: string) {
+    const packageName = selectedPackage()?.name;
+    if (!packageName) return;
+    assignPackageNameToProject(packageName, projectId);
+  }
+
+  function assignPackageNameToProject(packageName: string, projectId: string) {
+    setProjects((current) =>
+      current.map((project) =>
+        project.id === projectId
+          ? touchProject({
+              ...project,
+              recordingNames: project.recordingNames.includes(packageName)
+                ? project.recordingNames
+                : [...project.recordingNames, packageName],
+            })
+          : project,
+      ),
+    );
+  }
+
+  function moveRecordingCardToProject(recording: ProjectRecordingCard, projectId: string) {
+    const now = new Date().toISOString();
+    setProjects((current) =>
+      current.map((project) => {
+        if (recording.kind === "section" && recording.sectionId) {
+          const sectionRefs = project.sectionRefs.filter(
+            (ref) => ref.packageName !== recording.packageName || ref.sectionId !== recording.sectionId,
+          );
+          if (project.id !== projectId) return sectionRefs.length === project.sectionRefs.length ? project : { ...project, sectionRefs };
+          const nextRef: ProjectSectionRef = {
+            packageName: recording.packageName,
+            sectionId: recording.sectionId,
+            title: recording.title,
+            startMs: recording.startMs,
+            endMs: recording.endMs ?? recording.startMs,
+            assignedAt: now,
+          };
+          return touchProject({ ...project, sectionRefs: [...sectionRefs, nextRef] });
+        }
+
+        const recordingNames = project.recordingNames.filter((name) => name !== recording.packageName);
+        if (project.id !== projectId) return recordingNames.length === project.recordingNames.length ? project : { ...project, recordingNames };
+        return touchProject({ ...project, recordingNames: [...recordingNames, recording.packageName] });
+      }),
+    );
+  }
+
+  function renameProject(projectId: string, currentName: string) {
+    const nextName = window.prompt("Rename project", currentName)?.trim();
+    if (!nextName || nextName === currentName) return;
+    setProjects((current) =>
+      current.map((project) => (project.id === projectId ? touchProject({ ...project, name: nextName }) : project)),
+    );
+  }
+
+  function removeSelectedPackageFromProject(projectId: string) {
+    const packageName = selectedPackage()?.name;
+    if (!packageName) return;
+    setProjects((current) =>
+      current.map((project) =>
+        project.id === projectId
+          ? touchProject({
+              ...project,
+              recordingNames: project.recordingNames.filter((name) => name !== packageName),
+            })
+          : project,
+      ),
+    );
+  }
+
+  function assignSectionToProject(section: TranscriptSection, projectId: string) {
+    const packageName = selectedPackage()?.name;
+    if (!packageName) return;
+    const ref: ProjectSectionRef = {
+      packageName,
+      sectionId: section.id,
+      title: section.title,
+      startMs: section.startMs,
+      endMs: section.endMs,
+      assignedAt: new Date().toISOString(),
+    };
+    setProjects((current) =>
+      current.map((project) => {
+        if (project.id !== projectId) return project;
+        const alreadyAssigned = project.sectionRefs.some(
+          (item) => item.packageName === ref.packageName && item.sectionId === ref.sectionId,
+        );
+        return alreadyAssigned ? project : touchProject({ ...project, sectionRefs: [...project.sectionRefs, ref] });
+      }),
+    );
+  }
+
+  function removeSectionFromProject(section: TranscriptSection, projectId: string) {
+    const packageName = selectedPackage()?.name;
+    if (!packageName) return;
+    setProjects((current) =>
+      current.map((project) =>
+        project.id === projectId
+          ? touchProject({
+              ...project,
+              sectionRefs: project.sectionRefs.filter(
+                (item) => item.packageName !== packageName || item.sectionId !== section.id,
+              ),
+            })
+          : project,
+      ),
+    );
+  }
+
+  function deleteProject(projectId: string) {
+    setProjects((current) => current.filter((project) => project.id !== projectId));
+  }
+
+  function assignSectionFromSelect(section: TranscriptSection, value: string) {
+    if (!value) return;
+    const projectId = value === "__new__" ? createProject() : value;
+    if (projectId) assignSectionToProject(section, projectId);
+  }
+
+  function openProjectRecording(recording: ProjectRecordingCard) {
+    const memoPackage = packages().find((pkg) => pkg.name === recording.packageName);
+    if (!memoPackage) return;
+    setWorkspaceView("review");
+    selectPackage(memoPackage);
+    if (recording.kind === "section") {
+      window.requestAnimationFrame(() => {
+        const section = buildSections(memoPackage, normalizeTranscriptLines(memoPackage)).find((item) =>
+          recording.id.endsWith(`::${item.id}`),
+        );
+        if (section) {
+          const url = new URL(window.location.href);
+          url.hash = sectionDomId(section.id);
+          window.history.replaceState(null, "", `${url.pathname}${url.search}${url.hash}`);
+          scrollToSectionHash("smooth");
+        }
+      });
+    }
+  }
+
+  function openCollectedItem(row: CollectedItemRow) {
+    const memoPackage = packages().find((pkg) => pkg.name === row.packageName);
+    if (!memoPackage) return;
+    setWorkspaceView("review");
+    selectPackage(memoPackage);
+    if (row.reviewItem) {
+      setSelectedOverlayId(row.reviewItem.id);
+      const lines = normalizeTranscriptLines(memoPackage);
+      const overlay = buildOverlays(memoPackage, lines).find((item) => item.id === row.reviewItem?.id);
+      if (overlay) {
+        window.requestAnimationFrame(() => {
+          jumpTo(sourceStartMs(row.reviewItem!) ?? lines[overlay.startLine]?.startMs, overlay.startLine, false);
+        });
+      }
+      return;
+    }
+    const segmentId = row.question?.sectionId ?? row.question?.source?.segmentId ?? row.question?.sourceSegments?.[0]?.segmentId;
+    if (segmentId) {
+      window.requestAnimationFrame(() => {
+        const url = new URL(window.location.href);
+        url.hash = sectionDomId(segmentId);
+        window.history.replaceState(null, "", `${url.pathname}${url.search}${url.hash}`);
+        scrollToSectionHash("smooth");
+      });
+    }
+  }
+
+  function showMoreProjectCards(projectId: string) {
+    setProjectCardLimit((current) => ({
+      ...current,
+      [projectId]: Number.MAX_SAFE_INTEGER,
+    }));
+  }
+
+  function showLessProjectCards(projectId: string) {
+    setProjectCardLimit((current) => {
+      const next = { ...current };
+      delete next[projectId];
+      return next;
+    });
   }
 
   function linkToSection(section: TranscriptSection, event: MouseEvent) {
@@ -401,39 +903,85 @@ function App() {
       <header class="masthead">
         <div class="masthead-copy">
           <h1>Voice memo review</h1>
-          <div class="subtitle-line">
-            <span class="eyebrow">v2ctx transcript review</span>
-            <p>{selectedPackage() ? packageDisplayTitle(selectedPackage()!) : isLoading() ? "Loading transcripts" : "No transcript selected"}</p>
-            <span class="root-path">{libraryRoot() || "Local library"}</span>
-          </div>
         </div>
-        <div class="top-actions">
-          <button class="secondary-action help-action" type="button" onClick={() => setIsHelpOpen(true)}>
-            Help
+        <div class="view-switch" aria-label="Workspace view">
+          <button
+            classList={{ selected: workspaceView() === "review" }}
+            type="button"
+            onClick={() => setWorkspaceView("review")}
+          >
+            Review
           </button>
           <button
-            class="secondary-action"
-            disabled={isRefreshingLibrary()}
-            onClick={() => void refreshVoiceMemoLibrary()}
+            classList={{ selected: workspaceView() === "projects" }}
+            type="button"
+            onClick={() => setWorkspaceView("projects")}
           >
-            {isRefreshingLibrary() ? "Refreshing" : "Refresh recordings"}
+            Projects
           </button>
-          <label class="file-picker">
-            <input
-              type="file"
-              webkitdirectory
-              multiple
-              onChange={(event) => void handleFiles(event.currentTarget.files)}
-            />
-            Open package
-          </label>
+          <button
+            classList={{ selected: workspaceView() === "items" }}
+            type="button"
+            onClick={() => setWorkspaceView("items")}
+          >
+            Items
+          </button>
+          <button
+            classList={{ selected: workspaceView() === "memos" }}
+            type="button"
+            onClick={() => setWorkspaceView("memos")}
+          >
+            All memos
+          </button>
         </div>
+        <Popover
+          class="top-actions-menu"
+          panelClass="top-actions-popover"
+          triggerLabel="Application actions"
+          trigger="..."
+          content={({ close }) => (
+            <>
+              <ActionButton
+                variant="menu"
+                onClick={() => {
+                  setIsHelpOpen(true);
+                  close();
+                }}
+              >
+                Help
+              </ActionButton>
+              <ActionButton
+                variant="menu"
+                disabled={isRefreshingLibrary() || isRunningRemainingLlm()}
+                onClick={() => {
+                  void refreshVoiceMemoLibrary();
+                  close();
+                }}
+              >
+                {isRefreshingLibrary() ? "Refreshing" : "Refresh recordings"}
+              </ActionButton>
+              <ActionButton
+                variant="menu"
+                disabled={isRefreshingLibrary() || isRunningRemainingLlm() || !!processingPackageName()}
+                onClick={() => {
+                  void runLlmForRemainingPackages();
+                  close();
+                }}
+              >
+                {isRunningRemainingLlm() ? "Processing remaining" : "Run LLM on remaining"}
+              </ActionButton>
+            </>
+          )}
+        />
       </header>
 
       <Show when={loadError()}>
         <div class="error">{loadError()}</div>
       </Show>
 
+      <Show
+        when={workspaceView() !== "review"}
+        fallback={
       <section class="transcript-workspace" aria-busy={isLoading() && !packages().length}>
         <aside class="memo-list" aria-label="Voice transcripts">
           <div class="pane-head">
@@ -472,11 +1020,9 @@ function App() {
                         selected: selectedPackage()?.name === memoPackage.name,
                         fresh: freshPackageName() === memoPackage.name,
                       }}
-                      onClick={() => {
-                        setSelectedPackageName(memoPackage.name);
-                        setSelectedOverlayId("");
-                        setRestoredInitialSnippet(true);
-                      }}
+                      type="button"
+                      aria-current={selectedPackage()?.name === memoPackage.name ? "true" : undefined}
+                      onClick={() => selectPackage(memoPackage)}
                     >
                       <strong>{packageDisplayTitle(memoPackage)}</strong>
                       <span class="memo-subline">
@@ -508,19 +1054,38 @@ function App() {
           <Suspense fallback={<TranscriptPaneSkeleton />}>
             <AwaitResource resource={initialLibrary}>
               <div class="transcript-toolbar">
-                <div>
-                  <h2>{selectedPackage() ? packageDisplayTitle(selectedPackage()!) : "No transcript selected"}</h2>
-                  <p>
-                    {transcriptLines().length} transcript lines · {selectedPackage()?.reviewItems.length ?? 0} extracted items
-                  </p>
+                <div class="transcript-toolbar-main">
+                  <div class="transcript-title-block">
+                    <h2>{selectedPackage() ? packageDisplayTitle(selectedPackage()!) : "No transcript selected"}</h2>
+                    <p>
+                      {transcriptLines().length} transcript lines · {selectedPackage()?.reviewItems.length ?? 0} extracted items
+                    </p>
+                  </div>
+                  <div class="transcript-toolbar-actions">
+                    <ReviewActionsMenu
+                      canRunLlm={
+                        !!selectedPackage() &&
+                        !processingPackageName() &&
+                        !isRunningRemainingLlm() &&
+                        !rerunningQuestionsPackageName()
+                      }
+                      runLlmLabel={processingPackageName() === selectedPackage()?.name ? "Processing" : "Run LLM"}
+                      canRerunQuestions={!!selectedPackage() && !processingPackageName() && !rerunningQuestionsPackageName()}
+                      rerunQuestionsLabel={
+                        rerunningQuestionsPackageName() === selectedPackage()?.name ? "Rerunning" : "Rerun questions"
+                      }
+                      onRunLlm={() => void runLlmForSelectedPackage()}
+                      onRerunQuestions={() => void rerunFollowUpQuestionsForSelectedPackage()}
+                      canHide={!!selectedPackage()}
+                      onHide={() => {
+                        const name = selectedPackage()?.name;
+                        if (name) hidePackage(name);
+                      }}
+                      markdown={() => (selectedPackage() ? buildPackageMarkdown(selectedPackage()!) : "")}
+                      filename={() => markdownFilename(selectedPackage() ? packageDisplayTitle(selectedPackage()!) : "transcript")}
+                    />
+                  </div>
                 </div>
-                <button
-                  class="secondary-action run-llm-action"
-                  disabled={!selectedPackage() || !!processingPackageName()}
-                  onClick={() => void runLlmForSelectedPackage()}
-                >
-                  {processingPackageName() === selectedPackage()?.name ? "Processing" : "Run LLM"}
-                </button>
                 <div class="overlay-filter" aria-label="Overlay filter">
                   <For each={overlayFilters}>
                     {(filter) => (
@@ -564,15 +1129,60 @@ function App() {
                     {(section) => (
                       <article class="transcript-section" id={sectionDomId(section.id)}>
                         <header>
-                          <h3>
-                            <a
-                              class="section-title-link"
-                              href={`#${sectionDomId(section.id)}`}
-                              onClick={(event) => linkToSection(section, event)}
-                            >
-                              {section.title}
-                            </a>
-                          </h3>
+                          <div class="section-heading-row">
+                            <h3>
+                              <a
+                                class="section-title-link"
+                                href={`#${sectionDomId(section.id)}`}
+                                onClick={(event) => linkToSection(section, event)}
+                              >
+                                {section.title}
+                              </a>
+                            </h3>
+                            <div class="section-project-tools">
+                              <ExportMarkdownActions
+                                label="section transcript"
+                                size="sm"
+                                markdown={() => buildSectionMarkdown(section, selectedPackage())}
+                                filename={() =>
+                                  markdownFilename(
+                                    selectedPackage()
+                                      ? `${packageDisplayTitle(selectedPackage()!)}-${section.title}`
+                                      : section.title,
+                                  )
+                                }
+                              />
+                              <Show when={projects().length}>
+                                <select
+                                  aria-label={`Assign ${section.title} to project`}
+                                  value=""
+                                  onChange={(event) => {
+                                    assignSectionFromSelect(section, event.currentTarget.value);
+                                    event.currentTarget.value = "";
+                                  }}
+                                >
+                                  <option value="">Assign section</option>
+                                  <For each={projects()}>
+                                    {(project) => <option value={project.id}>{project.name}</option>}
+                                  </For>
+                                  <option value="__new__">New project...</option>
+                                </select>
+                              </Show>
+                            </div>
+                          </div>
+                          <Show when={selectedSectionProjectIds().get(section.id)?.size}>
+                            <div class="section-project-tags" aria-label="Section project assignments">
+                              <For each={projects().filter((project) => selectedSectionProjectIds().get(section.id)?.has(project.id))}>
+                                {(project) => (
+                                  <button type="button" onClick={() => removeSectionFromProject(section, project.id)}>
+                                    <span class="project-color-dot" style={{ "background-color": project.color }}></span>
+                                    {project.name}
+                                    <span aria-hidden="true">x</span>
+                                  </button>
+                                )}
+                              </For>
+                            </div>
+                          </Show>
                           <Show when={section.summary}>
                             {(summary) => (
                               <div class="memo-summary section-summary">
@@ -593,7 +1203,9 @@ function App() {
                                   {formatTime(line.startMs)}
                                 </button>
                                 <span class="transcript-text">
-                                  {renderLine(line, overlays(), selectedOverlay()?.id, selectOverlay)}
+                                  {renderLine(line, overlays(), selectedOverlay()?.id, (overlay) =>
+                                    selectOverlay(overlay, selectedPackage()?.name),
+                                  )}
                                 </span>
                               </p>
                             )}
@@ -616,8 +1228,58 @@ function App() {
                 {(url) => <audio ref={audioRef} controls src={url()} />}
               </Show>
 
+              <PanelTitle title="Projects" />
+              <div class="project-assignment-panel">
+                <Show
+                  when={projects().length}
+                  fallback={
+                    <button class="secondary-action" type="button" onClick={() => createProject()}>
+                      + New project
+                    </button>
+                  }
+                >
+                  <label for="recording-project-select">Add whole recording</label>
+                  <select
+                    id="recording-project-select"
+                    value=""
+                    onChange={(event) => {
+                      const value = event.currentTarget.value;
+                      if (!value) return;
+                      const projectId = value === "__new__" ? createProject() : value;
+                      if (projectId) assignSelectedPackageToProject(projectId);
+                      event.currentTarget.value = "";
+                    }}
+                  >
+                    <option value="">Choose project</option>
+                    <For each={projects()}>
+                      {(project) => <option value={project.id}>{project.name}</option>}
+                    </For>
+                    <option value="__new__">New project...</option>
+                  </select>
+                  <div class="assigned-project-list">
+                    <For each={selectedPackageProjects()} fallback={<span>No project assignments.</span>}>
+                      {(project) => (
+                        <button type="button" onClick={() => removeSelectedPackageFromProject(project.id)}>
+                          <span class="project-color-dot" style={{ "background-color": project.color }}></span>
+                          {project.name}
+                          <span aria-hidden="true">x</span>
+                        </button>
+                      )}
+                    </For>
+                  </div>
+                </Show>
+              </div>
+
+              <PanelTitle title="Review sections" />
+              <SidebarReviewStack
+                questions={selectedPackageQuestions()}
+                groups={sidebarReviewGroups()}
+                selectedOverlayId={selectedOverlay()?.id}
+                onSelectOverlay={(overlay) => selectOverlay(overlay, selectedPackage()?.name)}
+              />
+
               <PanelTitle title="Selected overlay" />
-              <Show when={selectedOverlay()} fallback={<EmptyState text="No overlays for this memo." />}>
+              <Show when={selectedOverlay()} fallback={<EmptyState text="Select a snippet to inspect its evidence." />}>
                 {(overlay) => (
                   <div class="overlay-detail">
                     <div class="detail-kicker">
@@ -649,22 +1311,6 @@ function App() {
                 )}
               </Show>
 
-              <PanelTitle title="Related snippets" />
-              <div class="snippet-list">
-                <For each={overlays()} fallback={<div class="empty compact">No snippets.</div>}>
-                  {(overlay) => (
-                    <button
-                      classList={{ snippet: true, selected: selectedOverlay()?.id === overlay.id }}
-                      onClick={() => selectOverlay(overlay)}
-                    >
-                      <span class={`type-dot type-dot-${overlay.type}`} />
-                      <strong>{overlay.item.title}</strong>
-                      <span>{overlay.snippet || overlay.item.item?.excerpt || "No matched transcript snippet."}</span>
-                    </button>
-                  )}
-                </For>
-              </div>
-
               <Show when={unmatchedItems().length}>
                 <PanelTitle title="Needs better evidence" />
                 <div class="unmatched-list">
@@ -677,11 +1323,1028 @@ function App() {
           </Suspense>
         </aside>
       </section>
+        }
+      >
+        <Show
+          when={workspaceView() === "projects"}
+          fallback={
+            <Show
+              when={workspaceView() === "items"}
+              fallback={
+                <AllMemosWorkspace
+                  packages={allPackages()}
+                  hiddenMemoNames={hiddenMemoNames()}
+                  visibleCount={packages().length}
+                  hiddenCount={hiddenMemoCount()}
+                  onHide={hidePackage}
+                  onRestore={restorePackage}
+                  onOpen={restoreAndOpenPackage}
+                />
+              }
+            >
+              <CollectedItemsWorkspace
+                rows={filteredCollectedItems()}
+                totalCount={collectedItems().length}
+                filter={collectedTypeFilter()}
+                typeCounts={collectedTypeCounts()}
+                onFilter={setCollectedTypeFilter}
+                onOpen={openCollectedItem}
+              />
+            </Show>
+          }
+        >
+          <ProjectsWorkspace
+            rows={projectRows()}
+            unassignedRecordings={unassignedRecordings()}
+            search={projectSearch()}
+            cardLimit={projectCardLimit()}
+            selectedCountTypes={projectCardCountTypes()}
+            onSearch={setProjectSearch}
+            onToggleCountType={(type) => toggleProjectCardCountType(type, setProjectCardCountTypes)}
+            isComposerOpen={isProjectComposerOpen()}
+            newProjectName={newProjectName()}
+            onNewProjectName={setNewProjectName}
+            onCreateProject={createProject}
+            onSaveProject={saveNewProject}
+            onCancelProject={() => {
+              setNewProjectName("");
+              setIsProjectComposerOpen(false);
+            }}
+            onDeleteProject={deleteProject}
+            onRenameProject={renameProject}
+            onOpenRecording={openProjectRecording}
+            onMoveRecording={moveRecordingCardToProject}
+            onShowMore={showMoreProjectCards}
+            onShowLess={showLessProjectCards}
+            projectMarkdown={(row) => buildProjectMarkdown(row.project, packages())}
+          />
+        </Show>
+      </Show>
 
       <Show when={isHelpOpen()}>
         <ProcessHelpModal onClose={() => setIsHelpOpen(false)} />
       </Show>
     </main>
+  );
+}
+
+function ExportMarkdownActions(props: {
+  label: string;
+  markdown: () => string;
+  filename: () => string;
+  size?: "md" | "sm";
+}) {
+  const [copyStatus, setCopyStatus] = createSignal<"idle" | "copied" | "failed">("idle");
+  let resetTimer: number | undefined;
+
+  onCleanup(() => {
+    if (resetTimer) window.clearTimeout(resetTimer);
+  });
+
+  const resetStatusSoon = () => {
+    if (resetTimer) window.clearTimeout(resetTimer);
+    resetTimer = window.setTimeout(() => setCopyStatus("idle"), 1600);
+  };
+
+  const copyLabel = () => {
+    if (copyStatus() === "copied") return "Copied";
+    if (copyStatus() === "failed") return "Copy failed";
+    return "Copy Markdown";
+  };
+  const hasMarkdown = () => !!props.markdown().trim();
+
+  return (
+    <div class="markdown-export-actions" aria-label={`Export ${props.label}`}>
+      <ActionButton
+        variant="primary"
+        size={props.size}
+        disabled={!hasMarkdown()}
+        onClick={async () => {
+          const markdown = props.markdown().trim();
+          if (!markdown) return;
+          const copied = await copyMarkdown(markdown);
+          setCopyStatus(copied ? "copied" : "failed");
+          resetStatusSoon();
+        }}
+      >
+        {copyLabel()}
+      </ActionButton>
+      <ActionButton
+        variant="secondary"
+        size={props.size}
+        disabled={!hasMarkdown()}
+        onClick={() => {
+          const markdown = props.markdown().trim();
+          if (!markdown) return;
+          downloadMarkdownFile(props.filename(), markdown);
+        }}
+      >
+        Download .md
+      </ActionButton>
+    </div>
+  );
+}
+
+function ProjectExportMenu(props: {
+  markdown: () => string;
+  filename: () => string;
+  onRenameProject: () => void;
+  onDissolveProject: () => void;
+}) {
+  const [copyStatus, setCopyStatus] = createSignal<"idle" | "copied" | "failed">("idle");
+  let resetTimer: number | undefined;
+  const hasMarkdown = () => !!props.markdown().trim();
+
+  onCleanup(() => {
+    if (resetTimer) window.clearTimeout(resetTimer);
+  });
+
+  const resetStatusSoon = () => {
+    if (resetTimer) window.clearTimeout(resetTimer);
+    resetTimer = window.setTimeout(() => setCopyStatus("idle"), 1600);
+  };
+
+  const copyLabel = () => {
+    if (copyStatus() === "copied") return "Copied";
+    if (copyStatus() === "failed") return "Copy failed";
+    return "Copy";
+  };
+
+  return (
+    <Popover
+      class="project-export-menu"
+      panelClass="project-export-popover"
+      triggerLabel="Project export actions"
+      trigger="..."
+      content={({ close }) => (
+        <>
+          <ActionButton
+            variant="menu"
+            onClick={() => {
+              props.onRenameProject();
+              close();
+            }}
+          >
+            Rename project
+          </ActionButton>
+          <span class="review-actions-divider" aria-hidden="true"></span>
+          <ActionButton
+            variant="menu"
+            disabled={!hasMarkdown()}
+            onClick={async () => {
+              const markdown = props.markdown().trim();
+              if (!markdown) return;
+              const copied = await copyMarkdown(markdown);
+              setCopyStatus(copied ? "copied" : "failed");
+              resetStatusSoon();
+              if (copied) close();
+            }}
+          >
+            {copyLabel()}
+          </ActionButton>
+          <ActionButton
+            variant="menu"
+            disabled={!hasMarkdown()}
+            onClick={() => {
+              const markdown = props.markdown().trim();
+              if (!markdown) return;
+              downloadMarkdownFile(props.filename(), markdown);
+              close();
+            }}
+          >
+            Download
+          </ActionButton>
+          <span class="review-actions-divider" aria-hidden="true"></span>
+          <ActionButton
+            variant="menu"
+            class="app-button-menu-danger"
+            onClick={() => {
+              props.onDissolveProject();
+              close();
+            }}
+          >
+            Dissolve project
+          </ActionButton>
+        </>
+      )}
+    />
+  );
+}
+
+function Popover(props: {
+  class: string;
+  panelClass: string;
+  trigger: JSX.Element;
+  triggerLabel?: string;
+  content: (controls: { close: () => void }) => JSX.Element;
+}) {
+  let detailsRef: HTMLDetailsElement | undefined;
+
+  const close = () => {
+    if (detailsRef) detailsRef.open = false;
+  };
+
+  onMount(() => {
+    const handlePointerDown = (event: PointerEvent) => {
+      if (!detailsRef?.open) return;
+      const target = event.target;
+      if (target instanceof Node && detailsRef.contains(target)) return;
+      close();
+    };
+    const handleKeyDown = (event: KeyboardEvent) => {
+      if (event.key !== "Escape" || !detailsRef?.open) return;
+      event.preventDefault();
+      close();
+      detailsRef.querySelector("summary")?.focus();
+    };
+    document.addEventListener("pointerdown", handlePointerDown);
+    document.addEventListener("keydown", handleKeyDown);
+    onCleanup(() => {
+      document.removeEventListener("pointerdown", handlePointerDown);
+      document.removeEventListener("keydown", handleKeyDown);
+    });
+  });
+
+  return (
+    <details class={`popover-root ${props.class}`} ref={detailsRef}>
+      <summary aria-label={props.triggerLabel} title={props.triggerLabel}>
+        {props.trigger}
+      </summary>
+      <div class={`popover-panel ${props.panelClass}`}>
+        {props.content({ close })}
+      </div>
+    </details>
+  );
+}
+
+function ReviewActionsMenu(props: {
+  canRunLlm: boolean;
+  runLlmLabel: string;
+  canRerunQuestions: boolean;
+  rerunQuestionsLabel: string;
+  canHide: boolean;
+  onRunLlm: () => void;
+  onRerunQuestions: () => void;
+  onHide: () => void;
+  markdown: () => string;
+  filename: () => string;
+}) {
+  let resetTimer: number | undefined;
+  const [copyStatus, setCopyStatus] = createSignal<"idle" | "copied" | "failed">("idle");
+  const hasMarkdown = () => !!props.markdown().trim();
+
+  onCleanup(() => {
+    if (resetTimer) window.clearTimeout(resetTimer);
+  });
+
+  const resetStatusSoon = () => {
+    if (resetTimer) window.clearTimeout(resetTimer);
+    resetTimer = window.setTimeout(() => setCopyStatus("idle"), 1600);
+  };
+  const copyLabel = () => {
+    if (copyStatus() === "copied") return "Copied Markdown";
+    if (copyStatus() === "failed") return "Copy failed";
+    return "Copy Markdown";
+  };
+
+  return (
+    <Popover
+      class="review-actions-menu"
+      panelClass="review-actions-popover"
+      triggerLabel="Review actions"
+      trigger="..."
+      content={({ close }) => (
+      <>
+        <ActionButton
+          variant="menu"
+          disabled={!props.canRunLlm}
+          onClick={() => {
+            props.onRunLlm();
+            close();
+          }}
+        >
+          {props.runLlmLabel}
+        </ActionButton>
+        <ActionButton
+          variant="menu"
+          disabled={!props.canRerunQuestions}
+          onClick={() => {
+            props.onRerunQuestions();
+            close();
+          }}
+        >
+          {props.rerunQuestionsLabel}
+        </ActionButton>
+        <ActionButton
+          variant="menu"
+          disabled={!props.canHide}
+          onClick={() => {
+            props.onHide();
+            close();
+          }}
+        >
+          Hide memo
+        </ActionButton>
+        <span class="review-actions-divider" aria-hidden="true"></span>
+        <ActionButton
+          variant="menu"
+          disabled={!hasMarkdown()}
+          onClick={async () => {
+            const markdown = props.markdown().trim();
+            if (!markdown) return;
+            const copied = await copyMarkdown(markdown);
+            setCopyStatus(copied ? "copied" : "failed");
+            resetStatusSoon();
+            if (copied) close();
+          }}
+        >
+          {copyLabel()}
+        </ActionButton>
+        <ActionButton
+          variant="menu"
+          disabled={!hasMarkdown()}
+          onClick={() => {
+            const markdown = props.markdown().trim();
+            if (!markdown) return;
+            downloadMarkdownFile(props.filename(), markdown);
+            close();
+          }}
+        >
+          Download .md
+        </ActionButton>
+      </>
+      )}
+    />
+  );
+}
+
+function CollectedItemsWorkspace(props: {
+  rows: CollectedItemRow[];
+  totalCount: number;
+  filter: CollectedItemType | "all";
+  typeCounts: Map<CollectedItemType, number>;
+  onFilter: (type: CollectedItemType | "all") => void;
+  onOpen: (row: CollectedItemRow) => void;
+}) {
+  const filters = () => collectedItemFilterOptions(props.typeCounts);
+
+  return (
+    <section class="collected-items-workspace" aria-label="Collected items">
+      <header class="collected-items-toolbar">
+        <div>
+          <h2>Collected items</h2>
+          <p>
+            {props.rows.length} shown · {props.totalCount} total questions, tasks, claims, quotes, and flags
+          </p>
+        </div>
+      </header>
+
+      <div class="collected-items-layout">
+        <aside class="collected-items-filter" aria-label="Filter collected items by type">
+          <h3>Type</h3>
+          <For each={filters()}>
+            {(filter) => (
+              <button
+                classList={{ selected: props.filter === filter.value }}
+                type="button"
+                onClick={() => props.onFilter(filter.value)}
+              >
+                <span>{filter.label}</span>
+                <span>{filter.count}</span>
+              </button>
+            )}
+          </For>
+        </aside>
+
+        <div class="collected-items-table" role="table" aria-label="Collected questions and review items">
+          <div class="collected-items-head" role="row">
+            <span role="columnheader">Type</span>
+            <span role="columnheader">Item</span>
+            <span role="columnheader">Original quote</span>
+            <span role="columnheader">Memo</span>
+          </div>
+          <For each={props.rows} fallback={<EmptyState text="No collected items match this filter." />}>
+            {(row) => (
+              <button class="collected-item-row" type="button" role="row" onClick={() => props.onOpen(row)}>
+                <span class="collected-item-cell collected-item-type-cell" role="cell">
+                  <span class={`type type-${row.type}`}>{collectedTypeLabels[row.type]}</span>
+                  <span>{row.time}</span>
+                </span>
+                <span class="collected-item-cell collected-item-content-cell" role="cell">
+                  <strong>{row.title}</strong>
+                  <span>{row.content}</span>
+                </span>
+                <span class="collected-item-cell collected-item-quote-cell" role="cell">
+                  {row.quote || "No source quote captured."}
+                </span>
+                <span class="collected-item-cell collected-item-source-cell" role="cell">
+                  <strong>{row.packageTitle}</strong>
+                  <span>{row.source}</span>
+                </span>
+              </button>
+            )}
+          </For>
+        </div>
+      </div>
+    </section>
+  );
+}
+
+function AllMemosWorkspace(props: {
+  packages: MemoPackage[];
+  hiddenMemoNames: Set<string>;
+  visibleCount: number;
+  hiddenCount: number;
+  onHide: (packageName: string) => void;
+  onRestore: (packageName: string) => void;
+  onOpen: (memoPackage: MemoPackage) => void;
+}) {
+  const sortedPackages = () => [...props.packages].sort(compareRecentlyUpdatedPackages);
+
+  return (
+    <section class="all-memos-workspace" aria-label="All voice memos">
+      <header class="all-memos-toolbar">
+        <div>
+          <h2>All voice memos</h2>
+          <p>
+            {props.visibleCount} visible · {props.hiddenCount} hidden · {props.packages.length} total
+          </p>
+        </div>
+      </header>
+
+      <div class="all-memos-table" role="table" aria-label="Voice memo visibility">
+        <div class="all-memos-head" role="row">
+          <span role="columnheader">Memo</span>
+          <span role="columnheader">Status</span>
+          <span role="columnheader">Length</span>
+          <span role="columnheader">Visibility</span>
+          <span role="columnheader">Actions</span>
+        </div>
+        <For each={sortedPackages()} fallback={<EmptyState text="No voice memos loaded." />}>
+          {(memoPackage) => {
+            const isHidden = () => props.hiddenMemoNames.has(memoPackage.name);
+            return (
+              <article class="all-memos-row" role="row" classList={{ hidden: isHidden() }}>
+                <div class="all-memos-cell memo-name-cell" role="cell">
+                  <strong>{packageDisplayTitle(memoPackage)}</strong>
+                  <span>{memoPackage.name}</span>
+                </div>
+                <div class="all-memos-cell" role="cell">
+                  <span>{memoPackage.status.replaceAll("_", " ")}</span>
+                  <span>
+                    {memoPackage.transcript.length} lines · {memoPackage.segments.length} sections
+                  </span>
+                </div>
+                <div class="all-memos-cell" role="cell">
+                  <span>{packageDurationMs(memoPackage) ? formatDuration(packageDurationMs(memoPackage)!) : "Unknown"}</span>
+                </div>
+                <div class="all-memos-cell" role="cell">
+                  <span class="visibility-badge" data-hidden={isHidden() ? "true" : "false"}>
+                    {isHidden() ? "Hidden" : "Visible"}
+                  </span>
+                </div>
+                <div class="all-memos-cell all-memos-actions" role="cell">
+                  <Show
+                    when={isHidden()}
+                    fallback={
+                      <>
+                        <ActionButton size="sm" variant="secondary" onClick={() => props.onOpen(memoPackage)}>
+                          Open
+                        </ActionButton>
+                        <ActionButton size="sm" variant="secondary" onClick={() => props.onHide(memoPackage.name)}>
+                          Hide
+                        </ActionButton>
+                      </>
+                    }
+                  >
+                    <ActionButton size="sm" variant="primary" onClick={() => props.onOpen(memoPackage)}>
+                      Restore
+                    </ActionButton>
+                  </Show>
+                </div>
+              </article>
+            );
+          }}
+        </For>
+      </div>
+    </section>
+  );
+}
+
+function ActionButton(props: {
+  children: JSX.Element;
+  variant?: "primary" | "secondary" | "danger" | "menu";
+  size?: "md" | "sm";
+  type?: "button" | "submit";
+  disabled?: boolean;
+  class?: string;
+  onClick?: JSX.EventHandler<HTMLButtonElement, MouseEvent>;
+}) {
+  return (
+    <button
+      classList={{
+        "app-button": true,
+        [`app-button-${props.variant ?? "secondary"}`]: true,
+        [`app-button-${props.size ?? "md"}`]: true,
+        [props.class ?? ""]: !!props.class,
+      }}
+      type={props.type ?? "button"}
+      disabled={props.disabled}
+      onClick={props.onClick}
+    >
+      {props.children}
+    </button>
+  );
+}
+
+function ProjectsWorkspace(props: {
+  rows: ProjectRow[];
+  unassignedRecordings: ProjectRecordingCard[];
+  search: string;
+  cardLimit: Record<string, number>;
+  selectedCountTypes: Set<ProjectCardCountType>;
+  isComposerOpen: boolean;
+  newProjectName: string;
+  onSearch: (value: string) => void;
+  onToggleCountType: (type: ProjectCardCountType) => void;
+  onNewProjectName: (value: string) => void;
+  onCreateProject: () => string | undefined;
+  onSaveProject: () => string | undefined;
+  onCancelProject: () => void;
+  onDeleteProject: (projectId: string) => void;
+  onRenameProject: (projectId: string, currentName: string) => void;
+  onOpenRecording: (recording: ProjectRecordingCard) => void;
+  onMoveRecording: (recording: ProjectRecordingCard, projectId: string) => void;
+  onShowMore: (projectId: string) => void;
+  onShowLess: (projectId: string) => void;
+  projectMarkdown: (row: ProjectRow) => string;
+}) {
+  return (
+    <section class="projects-workspace" aria-label="Projects">
+      <header class="projects-toolbar">
+        <div class="projects-title">
+          <h2>Projects</h2>
+        </div>
+        <div class="projects-controls">
+          <input
+            aria-label="Search projects"
+            value={props.search}
+            onInput={(event) => props.onSearch(event.currentTarget.value)}
+            placeholder="Search projects, memos, topics..."
+          />
+          <button class="secondary-action" type="button">
+            Sort: Last updated
+          </button>
+          <button class="primary-action" type="button" onClick={() => props.onCreateProject()}>
+            + New Project
+          </button>
+        </div>
+      </header>
+
+      <Show when={props.isComposerOpen}>
+        <form
+          class="project-composer"
+          onSubmit={(event) => {
+            event.preventDefault();
+            props.onSaveProject();
+          }}
+        >
+          <label for="new-project-name">Project name</label>
+          <input
+            id="new-project-name"
+            value={props.newProjectName}
+            onInput={(event) => props.onNewProjectName(event.currentTarget.value)}
+            placeholder="Customer Discovery, Product Strategy..."
+          />
+          <button class="primary-action" type="submit" disabled={!props.newProjectName.trim()}>
+            Create
+          </button>
+          <button class="secondary-action" type="button" onClick={props.onCancelProject}>
+            Cancel
+          </button>
+        </form>
+      </Show>
+
+      <div class="project-grid" role="table" aria-label="Project recordings">
+        <div class="project-grid-head" role="row">
+          <span role="columnheader">Project</span>
+          <span class="recordings-column-header" role="columnheader">
+            <span>Recordings</span>
+            <span class="project-count-toggles" aria-label="Project card count toggles">
+              <For each={projectCardCountOptions}>
+                {(type) => (
+                  <button
+                    classList={{ selected: props.selectedCountTypes.has(type) }}
+                    type="button"
+                    onClick={() => props.onToggleCountType(type)}
+                  >
+                    {projectCardCountLabels[type]}
+                  </button>
+                )}
+              </For>
+            </span>
+          </span>
+        </div>
+        <Show when={props.unassignedRecordings.length}>
+          <article class="project-row unassigned-project-row" role="row">
+            <div class="project-cell project-meta-cell" role="cell">
+              <div class="project-name-line">
+                <span class="project-folder unassigned-folder"></span>
+                <h3>No project assigned</h3>
+              </div>
+              <div class="project-facts">
+                <span>{props.unassignedRecordings.length} {props.unassignedRecordings.length === 1 ? "recording" : "recordings"}</span>
+                <span>Move recordings into a project</span>
+              </div>
+              <div class="project-tags">
+                <span>Catch all</span>
+              </div>
+            </div>
+
+            <div class="project-cell project-recordings-cell" role="cell">
+              <div class="recording-card-grid">
+                <For each={props.unassignedRecordings}>
+                  {(recording) => (
+                    <ProjectRecordingCardShell
+                      recording={recording}
+                      selectedCountTypes={props.selectedCountTypes}
+                      projects={props.rows.map((row) => row.project)}
+                      onOpen={() => props.onOpenRecording(recording)}
+                      onMove={(projectId) => props.onMoveRecording(recording, projectId)}
+                    />
+                  )}
+                </For>
+              </div>
+            </div>
+
+          </article>
+        </Show>
+        <For
+          each={props.rows}
+          fallback={
+            <div class="projects-empty">
+              <p>No projects yet. Create a project, then assign a whole recording or specific transcript section.</p>
+              <button class="primary-action" type="button" onClick={() => props.onCreateProject()}>
+                + New Project
+              </button>
+            </div>
+          }
+        >
+          {(row) => {
+            const isExpanded = () => props.cardLimit[row.project.id] === Number.MAX_SAFE_INTEGER;
+            return (
+              <article
+                class="project-row"
+                classList={{
+                  expanded: isExpanded(),
+                }}
+                role="row"
+              >
+                <div class="project-cell project-meta-cell" role="cell">
+                  <div class="project-name-line">
+                    <span class="project-folder" style={{ "background-color": row.project.color }}></span>
+                    <h3>{row.project.name}</h3>
+                    <ProjectExportMenu
+                      markdown={() => props.projectMarkdown(row)}
+                      filename={() => markdownFilename(`${row.project.name}-project-transcript`)}
+                      onRenameProject={() => props.onRenameProject(row.project.id, row.project.name)}
+                      onDissolveProject={() => props.onDeleteProject(row.project.id)}
+                    />
+                  </div>
+                  <div class="project-facts">
+                    <span>{projectDateRange(row.recordings)}</span>
+                    <span>{row.recordings.length} {row.recordings.length === 1 ? "recording" : "recordings"}</span>
+                    <span>{formatDuration(row.durationMs)} total</span>
+                  </div>
+                  <div class="project-row-actions">
+                    <p>Updated {relativeDate(row.project.updatedAt)}</p>
+                  </div>
+                </div>
+
+                <div class="project-cell project-recordings-cell" role="cell">
+                  <ProjectRecordingScroller
+                    projectId={row.project.id}
+                    recordings={row.recordings}
+                    selectedCountTypes={props.selectedCountTypes}
+                    projects={props.rows.map((row) => row.project)}
+                    isExpanded={isExpanded()}
+                    onOpenRecording={props.onOpenRecording}
+                    onMoveRecording={props.onMoveRecording}
+                    onShowMore={props.onShowMore}
+                    onShowLess={props.onShowLess}
+                  />
+                </div>
+
+              </article>
+            );
+          }}
+        </For>
+      </div>
+
+    </section>
+  );
+}
+
+function ProjectRecordingCardView(props: {
+  recording: ProjectRecordingCard;
+  selectedCountTypes: Set<ProjectCardCountType>;
+  onOpen: () => void;
+  onPointerDown?: JSX.EventHandler<HTMLButtonElement, PointerEvent>;
+  onPointerUp?: JSX.EventHandler<HTMLButtonElement, PointerEvent>;
+}) {
+  const visibleCounts = () =>
+    projectCardCountOptions
+      .filter((type) => props.selectedCountTypes.has(type))
+      .map((type) => ({ type, label: projectCardCountLabels[type], count: props.recording.counts[type] }))
+      .filter((item) => item.count > 0);
+
+  return (
+    <button
+      class="project-recording-card"
+      type="button"
+      onClick={props.onOpen}
+      onPointerDown={props.onPointerDown}
+      onPointerUp={props.onPointerUp}
+    >
+      <span class="recording-card-top">
+        <strong>{props.recording.title}</strong>
+      </span>
+      <span class="recording-date-line">
+        {packageDateLabel(props.recording.packageName)}
+        <span>{props.recording.durationMs ? formatDuration(props.recording.durationMs) : "Unknown duration"}</span>
+      </span>
+      <WaveformBars
+        packageName={props.recording.packageName}
+        audioUrl={props.recording.audioUrl}
+        audioSize={props.recording.audioSize}
+        audioMtimeMs={props.recording.audioMtimeMs}
+        seed={props.recording.id}
+        startMs={props.recording.startMs}
+        endMs={props.recording.endMs}
+      />
+      <span class="recording-sections">
+        <span>{props.recording.sectionCount} sections</span>
+        <For each={props.recording.topSections.slice(0, 3)}>
+          {(section, index) => (
+            <span>
+              <span>{String(index() + 1).padStart(2, "0")}</span>
+              <span>{section.title}</span>
+              <span>{section.time}</span>
+            </span>
+          )}
+        </For>
+      </span>
+      <span class="recording-count-row">
+        <For each={visibleCounts()}>
+          {(item) => (
+            <span class={`recording-count-pill count-${item.type}`}>
+              <span>{item.label}</span>
+              <strong>{item.count}</strong>
+            </span>
+          )}
+        </For>
+      </span>
+    </button>
+  );
+}
+
+function ProjectRecordingCardShell(props: {
+  recording: ProjectRecordingCard;
+  selectedCountTypes: Set<ProjectCardCountType>;
+  projects: ProjectRecord[];
+  onOpen: () => void;
+  onMove: (projectId: string) => void;
+  onPointerDown?: JSX.EventHandler<HTMLButtonElement, PointerEvent>;
+  onPointerUp?: JSX.EventHandler<HTMLButtonElement, PointerEvent>;
+}) {
+  return (
+    <span class="project-recording-card-shell">
+      <ProjectRecordingCardView
+        recording={props.recording}
+        selectedCountTypes={props.selectedCountTypes}
+        onOpen={props.onOpen}
+        onPointerDown={props.onPointerDown}
+        onPointerUp={props.onPointerUp}
+      />
+      <Show when={props.projects.length}>
+        <MoveRecordingMenu projects={props.projects} onMove={props.onMove} />
+      </Show>
+    </span>
+  );
+}
+
+function MoveRecordingMenu(props: {
+  projects: ProjectRecord[];
+  onMove: (projectId: string) => void;
+}) {
+  let triggerRef: HTMLButtonElement | undefined;
+  let panelRef: HTMLDivElement | undefined;
+  const [isOpen, setIsOpen] = createSignal(false);
+  const [position, setPosition] = createSignal({ top: 0, left: 0 });
+
+  const close = () => setIsOpen(false);
+  const updatePosition = () => {
+    if (!triggerRef) return;
+    const rect = triggerRef.getBoundingClientRect();
+    const panelWidth = panelRef?.offsetWidth ?? 190;
+    const panelHeight = panelRef?.offsetHeight ?? 260;
+    const gap = 6;
+    const left = Math.min(rect.right + gap, window.innerWidth - panelWidth - 8);
+    const top = Math.max(8, Math.min(rect.top, window.innerHeight - panelHeight - 8));
+    setPosition({ top, left: Math.max(8, left) });
+  };
+
+  onMount(() => {
+    const handlePointerDown = (event: PointerEvent) => {
+      if (!isOpen()) return;
+      const target = event.target;
+      if (!(target instanceof Node)) return;
+      if (triggerRef?.contains(target) || panelRef?.contains(target)) return;
+      close();
+    };
+    const handleKeyDown = (event: KeyboardEvent) => {
+      if (event.key !== "Escape" || !isOpen()) return;
+      event.preventDefault();
+      close();
+      triggerRef?.focus();
+    };
+    document.addEventListener("pointerdown", handlePointerDown);
+    document.addEventListener("keydown", handleKeyDown);
+    window.addEventListener("resize", updatePosition);
+    window.addEventListener("scroll", updatePosition, true);
+    onCleanup(() => {
+      document.removeEventListener("pointerdown", handlePointerDown);
+      document.removeEventListener("keydown", handleKeyDown);
+      window.removeEventListener("resize", updatePosition);
+      window.removeEventListener("scroll", updatePosition, true);
+    });
+  });
+
+  createEffect(() => {
+    if (!isOpen()) return;
+    updatePosition();
+    window.requestAnimationFrame(updatePosition);
+  });
+
+  return (
+    <span class="move-recording-menu">
+      <button
+        class="move-recording-trigger"
+        ref={triggerRef}
+        type="button"
+        aria-label="Move recording to project"
+        aria-haspopup="menu"
+        aria-expanded={isOpen()}
+        onClick={() => {
+          setIsOpen((value) => !value);
+          window.requestAnimationFrame(updatePosition);
+        }}
+      >
+        <span aria-hidden="true">-&gt;</span>
+      </button>
+      <Show when={isOpen()}>
+        <Portal>
+          <div
+            class="move-recording-popover"
+            ref={panelRef}
+            role="menu"
+            style={{
+              top: `${position().top}px`,
+              left: `${position().left}px`,
+            }}
+          >
+            <For each={props.projects} fallback={<span class="move-recording-empty">No projects</span>}>
+              {(project) => (
+                <button
+                  class="move-recording-option"
+                  type="button"
+                  role="menuitem"
+                  onClick={() => {
+                    props.onMove(project.id);
+                    close();
+                  }}
+                >
+                  <span class="project-color-dot" style={{ "background-color": project.color }}></span>
+                  <span>{project.name}</span>
+                </button>
+              )}
+            </For>
+          </div>
+        </Portal>
+      </Show>
+    </span>
+  );
+}
+
+function ProjectRecordingScroller(props: {
+  projectId: string;
+  recordings: ProjectRecordingCard[];
+  selectedCountTypes: Set<ProjectCardCountType>;
+  projects: ProjectRecord[];
+  isExpanded: boolean;
+  onOpenRecording: (recording: ProjectRecordingCard) => void;
+  onMoveRecording: (recording: ProjectRecordingCard, projectId: string) => void;
+  onShowMore: (projectId: string) => void;
+  onShowLess: (projectId: string) => void;
+}) {
+  let gridRef: HTMLDivElement | undefined;
+  let resizeObserver: ResizeObserver | undefined;
+  const [hasHorizontalOverflow, setHasHorizontalOverflow] = createSignal(false);
+
+  const measureOverflow = () => {
+    if (!gridRef) return;
+    setHasHorizontalOverflow(gridRef.scrollWidth > gridRef.clientWidth + 1);
+  };
+
+  onMount(() => {
+    measureOverflow();
+    resizeObserver = new ResizeObserver(measureOverflow);
+    if (gridRef) resizeObserver.observe(gridRef);
+    window.addEventListener("resize", measureOverflow);
+  });
+
+  createEffect(() => {
+    props.recordings.length;
+    props.isExpanded;
+    window.requestAnimationFrame(measureOverflow);
+  });
+
+  onCleanup(() => {
+    resizeObserver?.disconnect();
+    window.removeEventListener("resize", measureOverflow);
+  });
+
+  return (
+    <>
+      <div class="recording-card-grid" ref={gridRef}>
+        <For each={props.recordings} fallback={<div class="empty compact">No recordings assigned.</div>}>
+          {(recording) => (
+            <ProjectRecordingCardShell
+              recording={recording}
+              selectedCountTypes={props.selectedCountTypes}
+              projects={props.projects}
+              onOpen={() => props.onOpenRecording(recording)}
+              onMove={(projectId) => props.onMoveRecording(recording, projectId)}
+            />
+          )}
+        </For>
+      </div>
+      <Show when={!props.isExpanded && hasHorizontalOverflow()}>
+        <button class="show-more-recordings" type="button" onClick={() => props.onShowMore(props.projectId)}>
+          <span>Show more</span>
+          <span aria-hidden="true">v</span>
+        </button>
+      </Show>
+      <Show when={props.isExpanded}>
+        <button class="show-more-recordings" type="button" onClick={() => props.onShowLess(props.projectId)}>
+          <span>Show less</span>
+          <span aria-hidden="true">^</span>
+        </button>
+      </Show>
+    </>
+  );
+}
+
+function WaveformBars(props: {
+  packageName: string;
+  audioUrl?: string;
+  audioSize?: number;
+  audioMtimeMs?: number;
+  seed: string;
+  startMs?: number;
+  endMs?: number;
+}) {
+  const [bars, setBars] = createSignal<number[]>(fallbackWaveformBars(props.seed));
+
+  createEffect(() => {
+    const url = props.audioUrl;
+    if (!url || typeof window === "undefined") {
+      setBars(fallbackWaveformBars(props.seed));
+      return;
+    }
+    let cancelled = false;
+    void loadWaveformCache({
+      packageName: props.packageName,
+      audioUrl: url,
+      audioSize: props.audioSize,
+      audioMtimeMs: props.audioMtimeMs,
+    })
+      .then((nextBars) => {
+        const rangeBars = nextBars ? waveformBarsForRange(nextBars, props.startMs, props.endMs) : [];
+        if (!cancelled) setBars(rangeBars.length ? rangeBars : fallbackWaveformBars(props.seed));
+      })
+      .catch(() => {
+        if (!cancelled) setBars(fallbackWaveformBars(props.seed));
+      });
+    onCleanup(() => {
+      cancelled = true;
+    });
+  });
+
+  return (
+    <span class="waveform-bars" aria-hidden="true">
+      <For each={bars()}>{(bar) => <span style={{ height: `${Math.max(3, Math.round(bar * 28))}px` }}></span>}</For>
+    </span>
   );
 }
 
@@ -778,6 +2441,80 @@ function PanelTitle(props: { title: string }) {
   return <h2 class="panel-title">{props.title}</h2>;
 }
 
+function SidebarReviewStack(props: {
+  questions: FollowUpQuestion[];
+  groups: Array<{ value: OverlayType; label: string; overlays: TranscriptOverlay[] }>;
+  selectedOverlayId?: string;
+  onSelectOverlay: (overlay: TranscriptOverlay) => void;
+}) {
+  return (
+    <div class="sidebar-review-stack">
+      <SidebarSegment title="Questions" count={props.questions.length}>
+        <For each={props.questions} fallback={<p class="empty compact">No follow-up questions generated yet.</p>}>
+          {(question) => <FollowUpQuestionItem question={question} />}
+        </For>
+      </SidebarSegment>
+
+      <For each={props.groups}>
+        {(group) => (
+          <SidebarSegment title={group.label} count={group.overlays.length}>
+            <div class="sidebar-review-list">
+              <For each={group.overlays} fallback={<p class="empty compact">No {group.label.toLowerCase()} found.</p>}>
+                {(overlay) => (
+                  <button
+                    classList={{ "sidebar-review-item": true, selected: props.selectedOverlayId === overlay.id }}
+                    type="button"
+                    onClick={() => props.onSelectOverlay(overlay)}
+                  >
+                    <span class={`type type-${overlay.type}`}>{overlayLabels[overlay.type]}</span>
+                    <strong>{overlay.item.title}</strong>
+                    <span>{overlay.snippet || overlay.item.item?.excerpt || overlay.item.body || "No matched transcript snippet."}</span>
+                  </button>
+                )}
+              </For>
+            </div>
+          </SidebarSegment>
+        )}
+      </For>
+    </div>
+  );
+}
+
+function SidebarSegment(props: { title: string; count: number; children: JSX.Element }) {
+  return (
+    <details class="sidebar-segment">
+      <summary>
+        <span>{props.title}</span>
+        <span>{props.count}</span>
+      </summary>
+      <div class="sidebar-segment-body">{props.children}</div>
+    </details>
+  );
+}
+
+function FollowUpQuestionItem(props: { question: FollowUpQuestion }) {
+  return (
+    <article class="question-item">
+      <h4>{props.question.question}</h4>
+      <p>
+        <strong>Assumed answer</strong>
+        {props.question.assumedAnswer || "No clear assumed answer in the transcript."}
+      </p>
+      <Show when={props.question.alternatives.length}>
+        <div>
+          <strong>Other supported readings</strong>
+          <ul>
+            <For each={props.question.alternatives}>{(alternative) => <li>{alternative}</li>}</For>
+          </ul>
+        </div>
+      </Show>
+      <Show when={props.question.rationale}>
+        {(rationale) => <p class="question-rationale">{rationale()}</p>}
+      </Show>
+    </article>
+  );
+}
+
 function AwaitResource(props: { resource: () => LibraryLoadResult | undefined; children: JSX.Element }) {
   props.resource();
   return <>{props.children}</>;
@@ -866,18 +2603,6 @@ function EvidencePaneSkeleton() {
         <span class="skeleton-line wide"></span>
         <span class="skeleton-line medium"></span>
       </div>
-      <PanelTitle title="Related snippets" />
-      <div class="snippet-list">
-        <For each={[0, 1, 2]}>
-          {() => (
-            <div class="snippet skeleton-snippet">
-              <span class="type-dot skeleton-dot"></span>
-              <span class="skeleton-line title"></span>
-              <span class="skeleton-line meta"></span>
-            </div>
-          )}
-        </For>
-      </div>
     </div>
   );
 }
@@ -952,6 +2677,514 @@ function EmptyState(props: { text: string }) {
   return <div class="empty">{props.text}</div>;
 }
 
+function loadStoredProjects(): ProjectRecord[] {
+  if (typeof window === "undefined") return [];
+  try {
+    const raw = window.localStorage.getItem(projectsStorageKey);
+    if (!raw) return [];
+    const parsed = JSON.parse(raw) as ProjectRecord[];
+    if (!Array.isArray(parsed)) return [];
+    return parsed
+      .filter((project) => project && typeof project.id === "string" && typeof project.name === "string")
+      .map((project, index) => ({
+        id: project.id,
+        name: project.name,
+        description: typeof project.description === "string" ? project.description : undefined,
+        color: typeof project.color === "string" ? project.color : projectColor(index),
+        createdAt: typeof project.createdAt === "string" ? project.createdAt : new Date().toISOString(),
+        updatedAt: typeof project.updatedAt === "string" ? project.updatedAt : new Date().toISOString(),
+        recordingNames: Array.isArray(project.recordingNames)
+          ? project.recordingNames.filter((name): name is string => typeof name === "string")
+          : [],
+        sectionRefs: Array.isArray(project.sectionRefs)
+          ? project.sectionRefs.filter(isProjectSectionRef)
+          : [],
+      }));
+  } catch {
+    return [];
+  }
+}
+
+function saveStoredProjects(projects: ProjectRecord[]) {
+  if (typeof window === "undefined") return;
+  window.localStorage.setItem(projectsStorageKey, JSON.stringify(projects));
+}
+
+function loadStoredHiddenMemoNames(): Set<string> {
+  if (typeof window === "undefined") return new Set();
+  try {
+    const raw = window.localStorage.getItem(hiddenMemoStorageKey);
+    if (!raw) return new Set();
+    const parsed = JSON.parse(raw) as unknown;
+    if (!Array.isArray(parsed)) return new Set();
+    return new Set(parsed.filter((name): name is string => typeof name === "string" && !!name.trim()));
+  } catch {
+    return new Set();
+  }
+}
+
+function saveStoredHiddenMemoNames(hiddenMemoNames: Set<string>) {
+  if (typeof window === "undefined") return;
+  window.localStorage.setItem(hiddenMemoStorageKey, JSON.stringify([...hiddenMemoNames].sort()));
+}
+
+function isProjectSectionRef(value: unknown): value is ProjectSectionRef {
+  const ref = value as ProjectSectionRef;
+  return (
+    !!ref &&
+    typeof ref.packageName === "string" &&
+    typeof ref.sectionId === "string" &&
+    typeof ref.title === "string" &&
+    typeof ref.startMs === "number" &&
+    typeof ref.endMs === "number"
+  );
+}
+
+function touchProject(project: ProjectRecord): ProjectRecord {
+  return { ...project, updatedAt: new Date().toISOString() };
+}
+
+function projectColor(index: number): string {
+  return ["#2563eb", "#16a34a", "#db2777", "#d97706", "#7c3aed", "#0891b2"][index % 6];
+}
+
+function projectsForPackage(projects: ProjectRecord[], packageName: string): ProjectRecord[] {
+  if (!packageName) return [];
+  return projects.filter((project) => project.recordingNames.includes(packageName));
+}
+
+function buildProjectRows(projects: ProjectRecord[], packages: MemoPackage[]): ProjectRow[] {
+  return projects.map((project) => {
+    const recordings = buildProjectRecordingCards(project, packages);
+    const summaries = recordings.map((recording) => recording.summary).filter((value): value is string => !!value);
+    const insights = uniqueStrings(
+      recordings.flatMap((recording) => {
+        const memoPackage = packages.find((pkg) => pkg.name === recording.packageName);
+        return memoPackage?.transcriptSummary?.topBullets ?? [];
+      }),
+    );
+    return {
+      project,
+      recordings,
+      summary:
+        summaries[0] ??
+        (recordings.length
+          ? `This project includes ${recordings.length} assigned recording${recordings.length === 1 ? "" : "s"} sorted by source time.`
+          : "No recordings or sections have been assigned yet."),
+      insights,
+      durationMs: recordings.reduce((total, recording) => total + (recording.durationMs ?? 0), 0),
+    };
+  });
+}
+
+function buildProjectRecordingCards(project: ProjectRecord, packages: MemoPackage[]): ProjectRecordingCard[] {
+  const byName = new Map(packages.map((pkg) => [pkg.name, pkg]));
+  const wholeRecordingCards = project.recordingNames.flatMap((packageName): ProjectRecordingCard[] => {
+    const memoPackage = byName.get(packageName);
+    if (!memoPackage) return [];
+    const durationMs = packageDurationMs(memoPackage);
+    const sections = buildSections(memoPackage, normalizeTranscriptLines(memoPackage));
+    return [
+      {
+        id: `${project.id}::recording::${memoPackage.name}`,
+        projectId: project.id,
+        kind: "recording",
+        packageName: memoPackage.name,
+        title: packageDisplayTitle(memoPackage),
+        dateMs: packageDate(memoPackage.name),
+        startMs: 0,
+        endMs: durationMs,
+        durationMs,
+        summary: memoPackage.transcriptSummary?.summary,
+        counts: projectCardCounts(memoPackage),
+        sectionCount: sections.length,
+        topSections: sections.slice(0, 3).map((section) => ({
+          title: section.title,
+          time: formatTime(section.startMs),
+        })),
+        audioUrl: fileUrl(memoPackage.audio),
+        audioSize: memoPackage.audio?.size,
+        audioMtimeMs: memoPackage.audio?.mtimeMs,
+      },
+    ];
+  });
+
+  const sectionCards = project.sectionRefs.flatMap((ref): ProjectRecordingCard[] => {
+    const memoPackage = byName.get(ref.packageName);
+    if (!memoPackage) return [];
+    const sections = buildSections(memoPackage, normalizeTranscriptLines(memoPackage));
+    const section = sections.find((item) => item.id === ref.sectionId);
+    return [
+      {
+        id: `${project.id}::section::${ref.packageName}::${ref.sectionId}`,
+        projectId: project.id,
+        kind: "section",
+        packageName: ref.packageName,
+        title: ref.title,
+        dateMs: packageDate(ref.packageName),
+        startMs: ref.startMs,
+        endMs: ref.endMs,
+        durationMs: Math.max(0, ref.endMs - ref.startMs),
+        sectionId: ref.sectionId,
+        summary: section?.summary,
+        counts: projectCardCounts(memoPackage, ref.sectionId),
+        sectionCount: 1,
+        topSections: [{ title: packageDisplayTitle(memoPackage), time: formatTime(ref.startMs) }],
+        audioUrl: fileUrl(memoPackage.audio),
+        audioSize: memoPackage.audio?.size,
+        audioMtimeMs: memoPackage.audio?.mtimeMs,
+      },
+    ];
+  });
+
+  return [...wholeRecordingCards, ...sectionCards].sort(
+    (a, b) => a.dateMs - b.dateMs || a.startMs - b.startMs || a.title.localeCompare(b.title),
+  );
+}
+
+function buildUnassignedRecordingCards(projects: ProjectRecord[], packages: MemoPackage[]): ProjectRecordingCard[] {
+  const assignedPackageNames = new Set(projects.flatMap((project) => project.recordingNames));
+  return packages
+    .filter((memoPackage) => !assignedPackageNames.has(memoPackage.name))
+    .map((memoPackage): ProjectRecordingCard => {
+      const durationMs = packageDurationMs(memoPackage);
+      const sections = buildSections(memoPackage, normalizeTranscriptLines(memoPackage));
+      return {
+        id: `unassigned::recording::${memoPackage.name}`,
+        projectId: "unassigned",
+        kind: "recording",
+        packageName: memoPackage.name,
+        title: packageDisplayTitle(memoPackage),
+        dateMs: packageDate(memoPackage.name),
+        startMs: 0,
+        endMs: durationMs,
+        durationMs,
+        summary: memoPackage.transcriptSummary?.summary,
+        counts: projectCardCounts(memoPackage),
+        sectionCount: sections.length,
+        topSections: sections.slice(0, 3).map((section) => ({
+          title: section.title,
+          time: formatTime(section.startMs),
+        })),
+        audioUrl: fileUrl(memoPackage.audio),
+        audioSize: memoPackage.audio?.size,
+        audioMtimeMs: memoPackage.audio?.mtimeMs,
+      };
+    })
+    .sort((a, b) => a.dateMs - b.dateMs || a.title.localeCompare(b.title));
+}
+
+function followUpQuestionsForPackage(pkg: MemoPackage | undefined): FollowUpQuestion[] {
+  return pkg?.followUpQuestions?.questions ?? [];
+}
+
+function followUpQuestionsForSection(pkg: MemoPackage | undefined, sectionId: string): FollowUpQuestion[] {
+  if (!pkg) return [];
+  return followUpQuestionsForPackage(pkg).filter((question) => {
+    if (question.scope === "section" && question.sectionId === sectionId) return true;
+    return question.sourceSegments?.some((segment) => segment.segmentId === sectionId) ?? false;
+  });
+}
+
+function projectCardCounts(pkg: MemoPackage, sectionId?: string): Record<ProjectCardCountType, number> {
+  const reviewItems = sectionId ? reviewItemsForSection(pkg, sectionId) : pkg.reviewItems;
+  return {
+    question: sectionId ? followUpQuestionsForSection(pkg, sectionId).length : followUpQuestionsForPackage(pkg).length,
+    task: countReviewItems(reviewItems, (item) => item.type === "task"),
+    idea: countReviewItems(reviewItems, (item) => item.type === "claim" || item.type === "opinion" || item.type === "experience"),
+    quote: countReviewItems(reviewItems, (item) => item.type === "quote"),
+    blog_seed: countReviewItems(reviewItems, (item) => item.type === "blog_seed"),
+    sensitive_flag: countReviewItems(reviewItems, (item) => item.type === "sensitive_flag"),
+  };
+}
+
+function reviewItemsForSection(pkg: MemoPackage, sectionId: string): ReviewItem[] {
+  return pkg.reviewItems.filter((item) => item.source?.segmentId === sectionId);
+}
+
+function countReviewItems(items: ReviewItem[], predicate: (item: ReviewItem) => boolean): number {
+  return items.reduce((count, item) => count + (predicate(item) ? 1 : 0), 0);
+}
+
+function toggleProjectCardCountType(
+  type: ProjectCardCountType,
+  setTypes: Setter<Set<ProjectCardCountType>>,
+) {
+  setTypes((previous) => {
+    const next = new Set(previous);
+    if (next.has(type)) next.delete(type);
+    else next.add(type);
+    return next;
+  });
+}
+
+function buildCollectedItemRows(packages: MemoPackage[]): CollectedItemRow[] {
+  return packages
+    .flatMap((memoPackage) => {
+      const packageTitle = packageDisplayTitle(memoPackage);
+      const reviewRows = memoPackage.reviewItems.map((item): CollectedItemRow => {
+        const startMs = sourceStartMs(item);
+        return {
+          id: `${memoPackage.name}::review::${item.id}`,
+          type: item.type,
+          packageName: memoPackage.name,
+          packageTitle,
+          title: item.title || collectedTypeLabels[item.type],
+          content: collectedReviewItemContent(item),
+          quote: collectedReviewItemQuote(item),
+          source: sourceLabel(item),
+          time: formatRange(item),
+          sortMs: packageDate(memoPackage.name) + (startMs ?? 0) / 86_400_000,
+          reviewItem: item,
+        };
+      });
+      const questionRows = followUpQuestionsForPackage(memoPackage).map((question): CollectedItemRow => {
+        const startMs = parseClock(question.source?.start ?? question.sourceSegments?.[0]?.start);
+        return {
+          id: `${memoPackage.name}::question::${question.id}`,
+          type: "question",
+          packageName: memoPackage.name,
+          packageTitle,
+          title: question.question,
+          content: collectedQuestionContent(question),
+          quote: question.excerpt || question.evidence || "",
+          source: question.sourceSegments?.map((segment) => segment.title || segment.segmentId).filter(Boolean).join(", ") || "Follow-up questions",
+          time: collectedQuestionTime(question),
+          sortMs: packageDate(memoPackage.name) + (startMs ?? 0) / 86_400_000,
+          question,
+        };
+      });
+      return [...reviewRows, ...questionRows];
+    })
+    .sort((a, b) => b.sortMs - a.sortMs || a.type.localeCompare(b.type) || a.title.localeCompare(b.title));
+}
+
+function collectedReviewItemContent(item: ReviewItem): string {
+  return item.body?.trim() || item.item?.text?.trim() || item.item?.uncertainty?.trim() || "";
+}
+
+function collectedReviewItemQuote(item: ReviewItem): string {
+  return item.item?.excerpt?.trim() || item.body?.trim() || item.item?.text?.trim() || "";
+}
+
+function collectedQuestionContent(question: FollowUpQuestion): string {
+  const parts = [
+    question.assumedAnswer ? `Assumed answer: ${question.assumedAnswer}` : "",
+    question.alternatives.length ? `Alternatives: ${question.alternatives.join("; ")}` : "",
+    question.rationale ?? "",
+  ];
+  return parts.filter(Boolean).join(" ");
+}
+
+function collectedQuestionTime(question: FollowUpQuestion): string {
+  if (question.source?.start && question.source?.end) return `${question.source.start} - ${question.source.end}`;
+  const segment = question.sourceSegments?.find((item) => item.start || item.end);
+  if (segment?.start && segment.end) return `${segment.start} - ${segment.end}`;
+  if (segment?.start) return segment.start;
+  return question.scope === "section" ? "Section question" : "Transcript question";
+}
+
+function countCollectedItemTypes(rows: CollectedItemRow[]): Map<CollectedItemType, number> {
+  const counts = new Map<CollectedItemType, number>();
+  for (const row of rows) counts.set(row.type, (counts.get(row.type) ?? 0) + 1);
+  return counts;
+}
+
+function collectedItemFilterOptions(counts: Map<CollectedItemType, number>) {
+  const orderedTypes: CollectedItemType[] = [
+    "question",
+    "task",
+    "claim",
+    "opinion",
+    "experience",
+    "quote",
+    "blog_seed",
+    "sensitive_flag",
+  ];
+  const total = orderedTypes.reduce((sum, type) => sum + (counts.get(type) ?? 0), 0);
+  return [
+    { value: "all" as const, label: "All", count: total },
+    ...orderedTypes
+      .filter((type) => counts.has(type))
+      .map((type) => ({ value: type, label: collectedTypeLabels[type], count: counts.get(type) ?? 0 })),
+  ];
+}
+
+function uniqueStrings(values: string[]): string[] {
+  const seen = new Set<string>();
+  const result: string[] = [];
+  for (const value of values) {
+    const normalized = value.trim();
+    if (!normalized || seen.has(normalized.toLowerCase())) continue;
+    seen.add(normalized.toLowerCase());
+    result.push(normalized);
+  }
+  return result;
+}
+
+function projectDateRange(recordings: ProjectRecordingCard[]): string {
+  if (!recordings.length) return "No dates";
+  const sorted = [...recordings].filter((recording) => recording.dateMs > 0).sort((a, b) => a.dateMs - b.dateMs);
+  if (!sorted.length) return "No dates";
+  const first = new Date(sorted[0].dateMs).toLocaleDateString(undefined, { month: "short", day: "numeric", year: "numeric" });
+  const last = new Date(sorted.at(-1)!.dateMs).toLocaleDateString(undefined, { month: "short", day: "numeric", year: "numeric" });
+  return first === last ? first : `${first} - ${last}`;
+}
+
+function relativeDate(value: string): string {
+  const ms = Date.parse(value);
+  if (!Number.isFinite(ms)) return "recently";
+  const diffMs = Date.now() - ms;
+  const minutes = Math.floor(diffMs / 60_000);
+  if (minutes < 1) return "just now";
+  if (minutes < 60) return `${minutes}m ago`;
+  const hours = Math.floor(minutes / 60);
+  if (hours < 24) return `${hours}h ago`;
+  const days = Math.floor(hours / 24);
+  if (days === 1) return "yesterday";
+  return `${days} days ago`;
+}
+
+type WaveformCache = {
+  version: 1;
+  audio: {
+    url: string;
+    size?: number;
+    mtimeMs?: number;
+  };
+  durationMs: number;
+  samples: number[];
+};
+
+type WaveformCacheRequest = {
+  packageName: string;
+  audioUrl: string;
+  audioSize?: number;
+  audioMtimeMs?: number;
+};
+
+const waveformCacheVersion = 1;
+const waveformBucketCount = 2_400;
+const waveformCachePromises = new Map<string, Promise<WaveformCache | undefined>>();
+
+async function loadWaveformCache(request: WaveformCacheRequest): Promise<WaveformCache | undefined> {
+  const key = `${request.packageName}:${request.audioUrl}:${request.audioSize ?? ""}:${request.audioMtimeMs ?? ""}`;
+  const existing = waveformCachePromises.get(key);
+  if (existing) return existing;
+
+  const promise = loadWaveformCacheUnmemoized(request).catch((error) => {
+    waveformCachePromises.delete(key);
+    throw error;
+  });
+  waveformCachePromises.set(key, promise);
+  return promise;
+}
+
+async function loadWaveformCacheUnmemoized(request: WaveformCacheRequest): Promise<WaveformCache | undefined> {
+  const cached = await fetchWaveformCache(request);
+  if (cached) return cached;
+
+  const generated = await waveformCacheFromAudio(request.audioUrl, {
+    url: request.audioUrl,
+    size: request.audioSize,
+    mtimeMs: request.audioMtimeMs,
+  });
+  if (!generated) return undefined;
+
+  void saveWaveformCache(request.packageName, generated);
+  return generated;
+}
+
+async function fetchWaveformCache(request: WaveformCacheRequest): Promise<WaveformCache | undefined> {
+  const response = await fetch(`/api/voice-memos/${encodeURIComponent(request.packageName)}/waveform`, {
+    cache: "no-store",
+  });
+  if (response.status === 404) return undefined;
+  if (!response.ok) return undefined;
+  const payload = (await response.json()) as unknown;
+  return isUsableWaveformCache(payload, request) ? payload : undefined;
+}
+
+async function saveWaveformCache(packageName: string, cache: WaveformCache): Promise<void> {
+  await fetch(`/api/voice-memos/${encodeURIComponent(packageName)}/waveform`, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify(cache),
+  });
+}
+
+function isUsableWaveformCache(value: unknown, request: WaveformCacheRequest): value is WaveformCache {
+  const cache = value as WaveformCache;
+  return (
+    !!cache &&
+    cache.version === waveformCacheVersion &&
+    Array.isArray(cache.samples) &&
+    cache.samples.length > 0 &&
+    cache.samples.every((sample) => typeof sample === "number" && Number.isFinite(sample)) &&
+    cache.audio?.size === request.audioSize &&
+    cache.audio?.mtimeMs === request.audioMtimeMs
+  );
+}
+
+async function waveformCacheFromAudio(
+  url: string,
+  audio: WaveformCache["audio"],
+): Promise<WaveformCache | undefined> {
+  if (typeof AudioContext === "undefined") return undefined;
+  const response = await fetch(url);
+  const audioData = await response.arrayBuffer();
+  const context = new AudioContext();
+  try {
+    const buffer = await context.decodeAudioData(audioData.slice(0));
+    const channel = buffer.getChannelData(0);
+    return {
+      version: waveformCacheVersion,
+      audio,
+      durationMs: buffer.duration * 1000,
+      samples: sampleWaveformBars(channel, waveformBucketCount),
+    };
+  } finally {
+    void context.close();
+  }
+}
+
+function waveformBarsForRange(cache: WaveformCache, startMs = 0, endMs?: number): number[] {
+  if (!cache.samples.length) return [];
+  const durationMs = Math.max(1, cache.durationMs);
+  const startRatio = Math.max(0, Math.min(1, startMs / durationMs));
+  const endRatio = Math.max(startRatio, Math.min(1, (endMs ?? durationMs) / durationMs));
+  const start = Math.floor(startRatio * cache.samples.length);
+  const end = Math.max(start + 1, Math.ceil(endRatio * cache.samples.length));
+  return sampleWaveformBars(Float32Array.from(cache.samples.slice(start, end)), 52);
+}
+
+function sampleWaveformBars(samples: Float32Array, count: number): number[] {
+  if (!samples.length) return [];
+  const bars: number[] = [];
+  const bucketSize = Math.max(1, Math.floor(samples.length / count));
+  let max = 0;
+  for (let index = 0; index < count; index++) {
+    const start = index * bucketSize;
+    const end = Math.min(samples.length, start + bucketSize);
+    let sum = 0;
+    for (let cursor = start; cursor < end; cursor++) sum += Math.abs(samples[cursor]);
+    const value = sum / Math.max(1, end - start);
+    bars.push(value);
+    max = Math.max(max, value);
+  }
+  return bars.map((value) => (max > 0 ? value / max : 0.12));
+}
+
+function fallbackWaveformBars(seed: string): number[] {
+  let state = 0;
+  for (let index = 0; index < seed.length; index++) state = (state * 31 + seed.charCodeAt(index)) >>> 0;
+  return Array.from({ length: 52 }, (_, index) => {
+    state = (1664525 * state + 1013904223 + index) >>> 0;
+    const noise = (state % 1000) / 1000;
+    return 0.18 + noise * 0.82;
+  });
+}
+
 function normalizeTranscriptLines(pkg: MemoPackage): TranscriptLine[] {
   return pkg.transcript.map((line, index) => {
     const startMs =
@@ -1022,6 +3255,141 @@ function buildSections(pkg: MemoPackage, lines: TranscriptLine[]): TranscriptSec
       fallbackText: segment.text,
     };
   });
+}
+
+function buildPackageMarkdown(pkg: MemoPackage): string {
+  const lines = normalizeTranscriptLines(pkg);
+  const sections = buildSections(pkg, lines);
+  const parts = [
+    `# ${packageDisplayTitle(pkg)}`,
+    `Source package: ${pkg.name}`,
+    packageDurationMs(pkg) ? `Duration: ${formatDuration(packageDurationMs(pkg)!)}` : "",
+    pkg.transcriptSummary?.summary ? `\n## Summary\n\n${pkg.transcriptSummary.summary}` : "",
+    pkg.transcriptSummary?.topBullets.length
+      ? `\n## Key Points\n\n${pkg.transcriptSummary.topBullets.map((bullet) => `- ${bullet}`).join("\n")}`
+      : "",
+    "\n## Transcript",
+    sections.map((section) => sectionMarkdownBody(section, 3)).join("\n\n"),
+  ];
+  return compactMarkdown(parts);
+}
+
+function buildSectionMarkdown(section: TranscriptSection, pkg: MemoPackage | undefined): string {
+  const parts = [
+    `# ${section.title}`,
+    pkg ? `Source package: ${pkg.name}` : "",
+    `Time: ${formatTime(section.startMs)} - ${formatTime(section.endMs)}`,
+    section.summary ? `\n## Summary\n\n${section.summary}` : "",
+    "\n## Transcript",
+    transcriptTextMarkdown(section),
+  ];
+  return compactMarkdown(parts);
+}
+
+function buildProjectMarkdown(project: ProjectRecord, packages: MemoPackage[]): string {
+  const byName = new Map(packages.map((pkg) => [pkg.name, pkg]));
+  const recordingSections = project.recordingNames.flatMap((packageName) => {
+    const pkg = byName.get(packageName);
+    if (!pkg) return [];
+    return [`## ${packageDisplayTitle(pkg)}\n\n${buildPackageMarkdown(pkg).replace(/^# .+\n+/, "")}`];
+  });
+  const assignedSections = project.sectionRefs.flatMap((ref) => {
+    const pkg = byName.get(ref.packageName);
+    if (!pkg) return [];
+    const section = buildSections(pkg, normalizeTranscriptLines(pkg)).find((item) => item.id === ref.sectionId);
+    if (!section) return [];
+    return [
+      [
+        `## ${section.title}`,
+        `Source package: ${pkg.name}`,
+        `Time: ${formatTime(section.startMs)} - ${formatTime(section.endMs)}`,
+        section.summary ? `\n### Summary\n\n${section.summary}` : "",
+        "\n### Transcript",
+        transcriptTextMarkdown(section),
+      ].join("\n\n"),
+    ];
+  });
+  const parts = [
+    `# ${project.name}`,
+    "Project transcript export",
+    project.description ? `Description: ${project.description}` : "",
+    project.recordingNames.length ? "\n## Whole Recording Transcripts" : "",
+    recordingSections.join("\n\n"),
+    project.sectionRefs.length ? "\n## Assigned Section Transcripts" : "",
+    assignedSections.join("\n\n"),
+  ];
+  return compactMarkdown(parts);
+}
+
+function sectionMarkdownBody(section: TranscriptSection, headingLevel: number): string {
+  const heading = "#".repeat(Math.max(1, headingLevel));
+  const parts = [
+    `${heading} ${section.title}`,
+    `Time: ${formatTime(section.startMs)} - ${formatTime(section.endMs)}`,
+    section.summary ? `\n${heading}# Summary\n\n${section.summary}` : "",
+    `\n${heading}# Transcript`,
+    transcriptTextMarkdown(section),
+  ];
+  return compactMarkdown(parts);
+}
+
+function transcriptTextMarkdown(section: TranscriptSection): string {
+  if (section.lines.length) {
+    return section.lines
+      .filter((line) => line.text.trim())
+      .map((line) => `[${formatTime(line.startMs)}] ${line.text.trim()}`)
+      .join("\n\n");
+  }
+  return section.fallbackText?.trim() || "_No transcript text available._";
+}
+
+function compactMarkdown(parts: string[]): string {
+  return `${parts.filter((part) => part.trim()).join("\n\n").replace(/\n{3,}/g, "\n\n").trim()}\n`;
+}
+
+async function copyMarkdown(markdown: string): Promise<boolean> {
+  try {
+    if (navigator.clipboard?.writeText) {
+      await navigator.clipboard.writeText(markdown);
+      return true;
+    }
+  } catch {
+    // Fall through to the textarea path for local HTTP/file contexts that deny clipboard access.
+  }
+
+  const textArea = document.createElement("textarea");
+  textArea.value = markdown;
+  textArea.setAttribute("readonly", "");
+  textArea.style.position = "fixed";
+  textArea.style.opacity = "0";
+  document.body.append(textArea);
+  textArea.select();
+  try {
+    return document.execCommand("copy");
+  } finally {
+    textArea.remove();
+  }
+}
+
+function downloadMarkdownFile(filename: string, markdown: string) {
+  const blob = new Blob([markdown], { type: "text/markdown;charset=utf-8" });
+  const url = URL.createObjectURL(blob);
+  const anchor = document.createElement("a");
+  anchor.href = url;
+  anchor.download = filename.endsWith(".md") ? filename : `${filename}.md`;
+  document.body.append(anchor);
+  anchor.click();
+  anchor.remove();
+  URL.revokeObjectURL(url);
+}
+
+function markdownFilename(value: string): string {
+  const normalized = value
+    .trim()
+    .toLowerCase()
+    .replace(/[^a-z0-9]+/g, "-")
+    .replace(/^-+|-+$/g, "");
+  return `${normalized || "transcript"}.md`;
 }
 
 function buildOverlays(pkg: MemoPackage, lines: TranscriptLine[]): TranscriptOverlay[] {
@@ -1324,26 +3692,53 @@ function sourceLabel(item: ReviewItem): string {
 function readUrlSelection(): UrlSelection {
   if (typeof window === "undefined") return {};
   const params = new URLSearchParams(window.location.search);
+  const view = params.get(viewQueryParam);
   return {
     transcript: params.get(transcriptQueryParam) || undefined,
     snippet: params.get(snippetQueryParam) || undefined,
+    view: isWorkspaceView(view) ? view : undefined,
   };
 }
 
-function replaceUrlSelection(transcript: string, snippet: string) {
+function isWorkspaceView(value: string | null): value is WorkspaceView {
+  return value === "review" || value === "projects" || value === "items" || value === "memos";
+}
+
+function overlayIdForPackage(packageName: string, overlayId: string | undefined, packages: MemoPackage[]): string {
+  if (!overlayId) return "";
+  const memoPackage = packages.find((pkg) => pkg.name === packageName);
+  if (!memoPackage) return "";
+  return memoPackage.reviewItems.some((item) => item.id === overlayId) ? overlayId : "";
+}
+
+function replaceUrlSelection(selection: UrlSelection) {
   if (typeof window === "undefined") return;
   const url = new URL(window.location.href);
-  if (transcript) {
-    url.searchParams.set(transcriptQueryParam, transcript);
+  if (selection.transcript) {
+    url.searchParams.set(transcriptQueryParam, selection.transcript);
   } else {
     url.searchParams.delete(transcriptQueryParam);
   }
-  if (snippet) {
-    url.searchParams.set(snippetQueryParam, snippet);
+  if (selection.snippet) {
+    url.searchParams.set(snippetQueryParam, selection.snippet);
   } else {
     url.searchParams.delete(snippetQueryParam);
   }
+  if (selection.view) {
+    url.searchParams.set(viewQueryParam, selection.view);
+  } else {
+    url.searchParams.delete(viewQueryParam);
+  }
   const next = `${url.pathname}${url.search}${url.hash}`;
+  const current = `${window.location.pathname}${window.location.search}${window.location.hash}`;
+  if (next !== current) window.history.replaceState(null, "", next);
+}
+
+function clearSectionHash() {
+  if (typeof window === "undefined" || !window.location.hash) return;
+  const url = new URL(window.location.href);
+  url.hash = "";
+  const next = `${url.pathname}${url.search}`;
   const current = `${window.location.pathname}${window.location.search}${window.location.hash}`;
   if (next !== current) window.history.replaceState(null, "", next);
 }

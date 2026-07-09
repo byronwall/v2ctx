@@ -319,7 +319,7 @@ async function runVoiceMemos(opts) {
     const packageDir = uniquePackageDir(outputRoot, file);
     try {
       const before = await getPackageStatus(packageDir);
-      const needsLlmSummary = opts.runLlm && !before.exists.transcriptSummary;
+      const needsLlmSummary = opts.runLlm && (!before.exists.transcriptSummary || !before.exists.followUpQuestions);
       if (
         before.stage === "derived" &&
         !needsLlmSummary &&
